@@ -52,7 +52,8 @@ test('static path: describePipe + projectWiringGraph produce a catalog forwardab
 
   expect(sent).toHaveLength(1);
   expect(sent[0]).toMatchObject({
-    schemaVersion: 4,
+    // Bumped 4 → 5 with StageDescriptor.untrackedBranches (detached fork branches).
+    schemaVersion: 5,
     endpoints: [{ key: echo.id, kind: 'endpoint' }],
   });
 });

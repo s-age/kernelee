@@ -64,7 +64,14 @@ export interface WiringSymbolEntry {
 
 /** The projected, JSON-serializable static wiring graph — Swift's `IndexDocument`, scoped to wiring topology. */
 export interface WiringGraphDocument {
-  readonly schemaVersion: 4;
+  /**
+   * Golden-JSON contract version. Bumped 4 → 5 when `StageDescriptor` gained
+   * `untrackedBranches` (detached fork branches — see `pipe.ts`): an additive
+   * field, but the JSON shape a downstream consumer (devtools panel,
+   * py-kernelee, the mcp-tools scanner) reads changed, so the version moves in
+   * lockstep. Consumers should gate on `schemaVersion >= 5` to read the field.
+   */
+  readonly schemaVersion: 5;
   readonly endpoints: readonly WiringEndpoint[];
   readonly symbols: readonly WiringSymbolEntry[];
   /**
@@ -93,15 +100,21 @@ export interface WiringGraphDocument {
   readonly unlistedBoundSymbols: readonly string[];
 }
 
-/** Every stage in `stages`, plus every stage nested in a `fork`'s `branches`, recursively — Swift's `flattened`/`projectStage` walk. */
+/** Every stage in `stages`, plus every stage nested in a `fork`'s `branches`
+ * AND its `untrackedBranches`, recursively — Swift's `flattened`/`projectStage`
+ * walk. Untracked (detached) branches are folded in exactly like tracked ones:
+ * a detached branch's `symbolId`/`divertsTo` are real graph edges (a symbol it
+ * invokes, a flow it diverts to), so omitting them would silently drop those
+ * edges — the precise "silent absence" defect this project rejects. */
 function flattenStages(stages: readonly StageDescriptor[]): readonly StageDescriptor[] {
   const flat: StageDescriptor[] = [];
   for (const stage of stages) {
     flat.push(stage);
-    if (stage.branches !== undefined) {
-      for (const branch of stage.branches) {
-        flat.push(...flattenStages(branch));
-      }
+    for (const branch of stage.branches ?? []) {
+      flat.push(...flattenStages(branch));
+    }
+    for (const branch of stage.untrackedBranches ?? []) {
+      flat.push(...flattenStages(branch));
     }
   }
   return flat;
@@ -188,7 +201,7 @@ export function projectWiringGraph(
   );
 
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     endpoints,
     symbols,
     unresolvedDivertTargets: unresolved,

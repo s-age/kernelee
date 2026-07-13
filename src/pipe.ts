@@ -1,6 +1,7 @@
 import type { Kernel } from './kernel.js';
 import type { KernelSymbol } from './symbol.js';
-import { next, type ErasedStage, type Verb } from './verb.js';
+import type { DispatchKey } from './dispatch-key.js';
+import { divert, next, type ErasedStage, type Verb } from './verb.js';
 
 // MARK: - Branch arity (fork's static fan-out declaration)
 
@@ -135,6 +136,19 @@ export interface StageDescriptor {
    * actual target is decided by a runtime condition inside the closure).
    * Convention-level accuracy: a stale entry just fails to resolve to a real
    * pipeline at render time. Empty for every other kind.
+   *
+   * Two authoring tiers fill this **same** field, by design — the JSON shape
+   * a wiring-graph consumer reads never changes:
+   * - the legacy, unchecked tier (`VerbStageMeta.divertsTo`, a bare
+   *   `readonly string[]`) — free text, transcribed verbatim.
+   * - the typed, checked tier ({@link TypedVerbStageMeta}`.divertsTo`, a
+   *   `DivertTargets` map of {@link DispatchKey}s) — normalized eagerly at
+   *   construction via `Object.values(map).map(k => k.key)`. Which keys came
+   *   from a *typed* declaration (as opposed to a free string) is tracked
+   *   separately, off this descriptor, on {@link PipeStage.typedDivertKeys} —
+   *   `StageDescriptor` stays exactly the shape it always was; the extra bit
+   *   the typed tier needs lives where the golden-JSON contract doesn't see
+   *   it.
    */
   readonly divertsTo: readonly string[];
   /**
@@ -144,6 +158,31 @@ export interface StageDescriptor {
    * a fork" as absence, matching `branchArity`.)
    */
   readonly branches?: readonly (readonly StageDescriptor[])[];
+  /**
+   * `fork(branches)` only: each **untracked** (detached) branch's own
+   * `descriptors`, in the order they were declared — the second array of a
+   * `fork([tracked], [untracked])` call, and the sole branch of a `.spawn(…)`
+   * stage. `undefined` (not empty) when the fork declares no untracked
+   * branches, mirroring how {@link branches} is absent on a non-fork stage.
+   *
+   * Untracked branches run detached: fired but never joined, so the fork
+   * completes on the *tracked* set alone and an untracked branch may outlive
+   * it (or never terminate — e.g. an agent loop). Their results are discarded
+   * (they never land in the fork's cursor) and their failures route to the
+   * kernel error sink, not into the tracked `Promise.all` — see
+   * `PipeBuilder.fork` / `#forkStage` and `Kernel.reportDetached`. Kept as a
+   * **parallel** array rather than a per-branch `tracked` flag on
+   * {@link branches} so every existing `branches` consumer (the wiring-graph
+   * `flattenStages` fold, the devtools panel, py-kernelee) stays untouched;
+   * this field is purely additive. A wiring-graph fold MUST still recurse into
+   * it (an untracked branch's `symbolId`/`divertsTo` are real edges) — see
+   * `flattenStages` in `wiring-graph.ts`.
+   *
+   * Additive JSON-shape change: bumps `WiringGraphDocument.schemaVersion`
+   * (4 → 5). Swift's `StageDescriptor` gains the counterpart
+   * (`untrackedBranches: [[StageDescriptor]]`, default `[]`).
+   */
+  readonly untrackedBranches?: readonly (readonly StageDescriptor[])[];
   /**
    * `fork(branches)` only: the declared fan-out arity — `fixedArity(n)` (the
    * default: the branch count at construction) or `runtimeArity` when the
@@ -192,6 +231,30 @@ export interface StageDescriptor {
 export interface PipeStage {
   readonly descriptor: StageDescriptor;
   readonly run: ErasedStage;
+  /**
+   * @internal The subset of `descriptor.divertsTo` that came from a *typed*
+   * declaration (a {@link DivertTargets} map), not a free string — absent
+   * (not merely empty) when this stage declares no typed targets, which is
+   * the overwhelming common case (every `tap`/`map`/`effect`/legacy-`pipe`
+   * stage). Lives here, off `StageDescriptor`, specifically so the
+   * golden-JSON contract `StageDescriptor` is part of never grows a field:
+   * `KernelBuilder.build()`'s typed-divert assertion (see `kernel.ts`'s
+   * `KernelBuilder.flow`) is the only reader, walking `Pipe.stages` directly
+   * rather than `Pipe.descriptors`.
+   *
+   * `fork(branches)` stages are the one case where this is *not* simply "the
+   * keys this stage itself declared": a fork stage has no `divertsTo` of its
+   * own, but its branches are sub-`Pipe`s that can each declare typed
+   * targets — and those declarations must not become invisible to `build()`
+   * just because they are one level down. `PipeBuilder.#forkStage` therefore
+   * stamps the fork's own `typedDivertKeys` with the **union** of every
+   * branch pipe's {@link Pipe.declaredTypedDivertKeys}, so a single
+   * top-level walk (`Pipe.declaredTypedDivertKeys` itself, reading only
+   * `stage.typedDivertKeys` per stage, never `descriptor.branches`) already
+   * sees everything, recursively, however many fork levels deep — each
+   * inner fork pre-aggregated its own subtree at *its* construction time.
+   */
+  readonly typedDivertKeys?: readonly string[];
 }
 
 // MARK: - Anonymous verb stage vocabulary
@@ -223,6 +286,90 @@ export type VerbStageFn<Cursor, Next> = (
 export interface VerbStageMeta {
   readonly note: string;
   readonly divertsTo?: readonly string[];
+}
+
+// MARK: - Typed divert channel
+
+/**
+ * What a `pipe`/`pipeline` anonymous verb stage can declare as its *checked*
+ * `divertsTo`: a map from an author-chosen local name (the property key,
+ * meaningful only inside this one stage's closure) to the {@link DispatchKey}
+ * it names. The typed twin of `VerbStageMeta.divertsTo`'s `readonly
+ * string[]` — see {@link TypedVerbStageMeta}.
+ *
+ * `any` (not `unknown`) in the `DispatchKey<any>` bound is deliberate: this
+ * type exists only to be indexed by {@link DivertChannel}'s mapped type,
+ * which re-derives each entry's real `P` via `infer` — the bound itself never
+ * needs to be sound on its own, only permissive enough to hold keys of
+ * differing payload types side by side in one object literal (a `DispatchKey
+ * <unknown>` bound would reject exactly that).
+ */
+export type DivertTargets = Record<string, DispatchKey<any>>;
+
+/**
+ * The third argument a typed verb stage receives — one callable per entry in
+ * its `DivertTargets` map, each pinned to that entry's own payload type by
+ * `tsc`. `diverts.retry(payload)` both selects `retry`'s `DispatchKey` *and*
+ * checks `payload` against that key's `P` in the same expression; there is no
+ * way to reach for a target this stage did not itself declare (the channel's
+ * keys are exactly `keyof T`), and no way to divert with the wrong payload
+ * shape for the target reached.
+ *
+ * Each entry returns `Verb<never>` — same reasoning as {@link divert}'s own
+ * return type: a divert feeds no downstream stage in *this* pipe, so it
+ * carries no forward type of its own; `Verb<never>` is assignable to
+ * whatever `Verb<Next>` the stage's signature promises.
+ *
+ * Built by {@link buildDivertChannel}, one function per map entry, each a
+ * closure over nothing but that entry's own `DispatchKey` — see that
+ * function's doc comment for why each call is `divert({ key, payload })`
+ * inline rather than a call through {@link keyedDiversion}.
+ */
+export type DivertChannel<T extends DivertTargets> = {
+  readonly [K in keyof T]: T[K] extends DispatchKey<infer P> ? (payload: P) => Verb<never> : never;
+};
+
+/**
+ * The typed twin of {@link VerbStageMeta}, selected by shape (see
+ * `PipeBuilder.pipe`'s runtime discrimination: `Array.isArray(divertsTo)` —
+ * true is the legacy tier, a plain object is this one) rather than by a
+ * separate method or flag. `divertsTo` is **required** here (unlike the
+ * legacy tier's optional array) — a stage with nothing to declare simply uses
+ * {@link VerbStageMeta} instead; there is no typed-tier "declare nothing"
+ * case to support.
+ */
+export interface TypedVerbStageMeta<T extends DivertTargets> {
+  readonly note: string;
+  readonly divertsTo: T;
+}
+
+/**
+ * The typed twin of {@link VerbStageFn}: identical `(kernel, cursor)` head,
+ * plus a third parameter — the {@link DivertChannel} built from this stage's
+ * own `TypedVerbStageMeta.divertsTo` map, letting the closure body reach
+ * `diverts.someTarget(payload)` instead of hand-assembling a `Diversion`.
+ */
+export type TypedVerbStageFn<Cursor, Next, T extends DivertTargets> = (
+  kernel: Kernel,
+  cursor: Cursor,
+  diverts: DivertChannel<T>,
+) => Verb<Next> | Promise<Verb<Next>>;
+
+/**
+ * Build the `DivertChannel` a typed verb stage receives: one closure per
+ * `DivertTargets` entry, each doing exactly what {@link keyedDiversion} +
+ * {@link divert} would, inlined — `divert({ key: k.key, payload })` — rather
+ * than calling through that factory. The two paths build the identical `{
+ * key, payload }` `Diversion` shape; this one skips the factory purely
+ * because it is already iterating the map to build the channel object, so a
+ * second function call per entry would add nothing.
+ */
+function buildDivertChannel<T extends DivertTargets>(targets: T): DivertChannel<T> {
+  const channel: Record<string, (payload: unknown) => Verb<never>> = {};
+  for (const [name, key] of Object.entries(targets)) {
+    channel[name] = (payload: unknown) => divert({ key: (key as DispatchKey<unknown>).key, payload });
+  }
+  return channel as DivertChannel<T>;
 }
 
 // MARK: - Optional stage meta (map/effect/fork)
@@ -312,6 +459,25 @@ export class Pipe<in I, out O> {
   get descriptors(): readonly StageDescriptor[] {
     return this.stages.map((stage) => stage.descriptor);
   }
+
+  /**
+   * @internal The union of every stage's {@link PipeStage.typedDivertKeys} —
+   * the *typed*-tier subset of this pipe's declared divert targets,
+   * deduplicated. `KernelBuilder.build()`'s assertion is the only reader
+   * (see `kernel.ts`'s `KernelBuilder.flow`): it walks every registered
+   * flow's pipe through this getter to find typed declarations with no
+   * matching `flow()` binding. Recursive through fork nesting "for free" —
+   * see {@link PipeStage.typedDivertKeys}'s doc comment on why a fork's own
+   * entry already carries its branches' union, so this single flat walk
+   * needs no separate recursion into `descriptor.branches`.
+   */
+  get declaredTypedDivertKeys(): readonly string[] {
+    const keys = new Set<string>();
+    for (const stage of this.stages) {
+      for (const key of stage.typedDivertKeys ?? []) keys.add(key);
+    }
+    return [...keys];
+  }
 }
 
 // MARK: - Builder
@@ -364,12 +530,34 @@ export class PipeBuilder<in Input, out Cursor> {
    * (see {@link VerbStageFn}). Runs its closure directly, **not** through
    * `kernel.invoke` — same as Swift, where only symbol-backed stages hit the
    * chokepoint (that is what makes a trace read as symbol traffic).
+   *
+   * Third shape — `pipe(typedMeta, typedVerbFn)`: the checked-divert twin of
+   * the second shape. `typedMeta.divertsTo` is a {@link DivertTargets} map
+   * (a plain object) instead of the legacy `readonly string[]`; the closure
+   * then receives a third argument, a {@link DivertChannel} built from that
+   * map, so `diverts.someTarget(payload)` replaces hand-assembling a
+   * `Diversion` — and `tsc` pins `payload` to that target's own
+   * `DispatchKey`'s `P`. Runtime discrimination between this shape and the
+   * second is `Array.isArray(divertsTo)` — a legacy array vs. a typed
+   * object are never confusable, so no separate method or flag is needed.
+   * `StageDescriptor.divertsTo` is filled identically either way (eagerly
+   * normalized to `Object.values(map).map(k => k.key)` for this shape) —
+   * the JSON shape a wiring-graph consumer reads never changes; only
+   * {@link PipeStage.typedDivertKeys} (never exported, read only by
+   * `KernelBuilder.build()`'s assertion) records that these particular keys
+   * came from a typed declaration.
    */
   pipe<Next>(symbol: KernelSymbol<Cursor, Next>): PipeBuilder<Input, Next>;
   pipe<Next>(meta: VerbStageMeta, stage: VerbStageFn<Cursor, Next>): PipeBuilder<Input, Next>;
+  pipe<Next, T extends DivertTargets>(
+    meta: TypedVerbStageMeta<T>,
+    stage: TypedVerbStageFn<Cursor, Next, T>,
+  ): PipeBuilder<Input, Next>;
   pipe(
-    first: KernelSymbol<never, unknown> | VerbStageMeta,
-    second?: (kernel: Kernel, cursor: never) => Verb<unknown> | Promise<Verb<unknown>>,
+    first: KernelSymbol<never, unknown> | VerbStageMeta | TypedVerbStageMeta<DivertTargets>,
+    second?:
+      | ((kernel: Kernel, cursor: never) => Verb<unknown> | Promise<Verb<unknown>>)
+      | ((kernel: Kernel, cursor: never, diverts: DivertChannel<DivertTargets>) => Verb<unknown> | Promise<Verb<unknown>>),
   ): PipeBuilder<Input, unknown> {
     if ('id' in first) {
       const sym = first;
@@ -378,13 +566,30 @@ export class PipeBuilder<in Input, out Cursor> {
         run: (kernel, value, parentSpan) => kernel.invoke(sym.id, value, parentSpan),
       });
     }
+    if (first.divertsTo !== undefined && !Array.isArray(first.divertsTo)) {
+      const targets = first.divertsTo as DivertTargets;
+      const stage = second as TypedVerbStageFn<unknown, unknown, DivertTargets>;
+      const handlerName = handlerNameOf(stage);
+      const divertsTo = Object.values(targets).map((key) => key.key);
+      const channel = buildDivertChannel(targets);
+      return this.#appending({
+        descriptor: {
+          kind: handlerName === undefined ? 'pipe(closure)' : 'pipe(function)',
+          note: first.note,
+          divertsTo,
+          handlerName,
+        },
+        typedDivertKeys: divertsTo,
+        run: (kernel, value) => stage(kernel, value, channel),
+      });
+    }
     const stage = second as VerbStageFn<unknown, unknown>;
     const handlerName = handlerNameOf(stage);
     return this.#appending({
       descriptor: {
         kind: handlerName === undefined ? 'pipe(closure)' : 'pipe(function)',
         note: first.note,
-        divertsTo: first.divertsTo ?? [],
+        divertsTo: (first.divertsTo as readonly string[] | undefined) ?? [],
         handlerName,
       },
       run: (kernel, value) => stage(kernel, value),
@@ -585,6 +790,48 @@ export class PipeBuilder<in Input, out Cursor> {
     branches: ReadonlyArray<ForkBranch<Cursor, R>>,
     arity?: BranchArity,
   ): PipeBuilder<Input, R[]>;
+  /**
+   * Tracked + **untracked** (detached) form: the first array joins exactly
+   * like the array overload above (its results fill the `R[]` cursor, its
+   * `fail` still rejects the whole fork); the second array is fired *detached*
+   * — never joined, so the fork completes on the tracked set alone. Untracked
+   * branches:
+   * - **outlive the fork** — an untracked branch may still be running (or may
+   *   never terminate: an agent/generation loop) after the tracked join
+   *   returns and downstream stages proceed;
+   * - **discard their results** — nothing lands in the cursor (hence
+   *   `ForkBranch<Cursor, unknown>`, decision (d): the aggregation ignores
+   *   their output type; each branch still type-checks internally);
+   * - **route failures to the kernel error sink** — a rejection is caught at
+   *   the fork and reported via `Kernel.reportDetached` (→ the same
+   *   `#errorSink`/`KernelBuildOptions.onError` a failed `dispatch` uses,
+   *   default a `KernelErrorState` write), never contaminating the tracked
+   *   `Promise.all`. The always-visible sink (decision (a)) is the structural
+   *   fix for the old `void kernel.run(pipe).catch(…)` escape hatch: a
+   *   detached branch's failure has a first-class home instead of a hand-rolled
+   *   `.catch`.
+   *
+   * Runtime discrimination is the same "shape gap" the leading-`meta` twin
+   * uses: after the meta strip, `Array.isArray(args[1])` tells the tracked +
+   * untracked form (`fork([a,b], [c])`) apart from the array + arity form
+   * (`fork([a,b], runtimeArity)`) — a {@link BranchArity} is an object, never
+   * an array. `arity` (for the *tracked* set) is then `args[2]`.
+   *
+   * `fork([], [x])` is the pure-launch degenerate case: no tracked branches,
+   * so the cursor becomes `unknown[]` (`[]`), and `x` runs detached — see
+   * {@link spawn} for the cursor-forwarding sugar over exactly this shape.
+   */
+  fork<R>(
+    tracked: ReadonlyArray<ForkBranch<Cursor, R>>,
+    untracked: ReadonlyArray<ForkBranch<Cursor, unknown>>,
+    arity?: BranchArity,
+  ): PipeBuilder<Input, R[]>;
+  fork<R>(
+    meta: StageMeta,
+    tracked: ReadonlyArray<ForkBranch<Cursor, R>>,
+    untracked: ReadonlyArray<ForkBranch<Cursor, unknown>>,
+    arity?: BranchArity,
+  ): PipeBuilder<Input, R[]>;
   fork(
     first:
       | ForkBranch<never, unknown>
@@ -605,12 +852,59 @@ export class PipeBuilder<in Input, out Cursor> {
     const args = hasMeta ? rest : [first, ...rest];
 
     if (Array.isArray(args[0])) {
-      const pipes = (args[0] as ReadonlyArray<ForkBranch<never, unknown>>).map(sealBranch);
+      const tracked = (args[0] as ReadonlyArray<ForkBranch<never, unknown>>).map(sealBranch);
+      // A second array is the untracked (detached) branch list; a non-array
+      // (or absent) `args[1]` is the tracked set's `BranchArity`. `BranchArity`
+      // is an object and never an array, so the two forms never collide.
+      if (Array.isArray(args[1])) {
+        const untracked = (args[1] as ReadonlyArray<ForkBranch<never, unknown>>).map(sealBranch);
+        const arity = args[2] as BranchArity | undefined;
+        return this.#forkStage(tracked, arity ?? fixedArity(tracked.length), meta, untracked);
+      }
       const arity = args[1] as BranchArity | undefined;
-      return this.#forkStage(pipes, arity ?? fixedArity(pipes.length), meta);
+      return this.#forkStage(tracked, arity ?? fixedArity(tracked.length), meta);
     }
     const pipes = (args as readonly ForkBranch<never, unknown>[]).map(sealBranch);
     return this.#forkStage(pipes, fixedArity(pipes.length), meta);
+  }
+
+  /**
+   * Launch `branch` **detached** and keep the current value flowing unchanged —
+   * a tap/effect-shaped surface over `fork([], [branch])` (zero tracked
+   * branches, one untracked). Sugar for the common "fire a side effect and
+   * continue" case: logging, telemetry, prefetch, or launching a long-running
+   * loop (see the migration of lifegame's tick-loop launch).
+   *
+   * Unlike {@link fork}`([], [branch])` — whose cursor becomes `unknown[]`
+   * (`[]`) — `.spawn` forwards `Cursor` untouched, exactly like `.tap`/
+   * `.effect`: the detached work is off to the side, not a value the pipe
+   * consumes. Its result is discarded and its failure routes to the kernel
+   * error sink (`Kernel.reportDetached`), same as any untracked fork branch.
+   *
+   * Deliberately **only** accepts a sub-`Pipe`/`PipeBuilder` (a
+   * {@link ForkBranch}), never a bare closure or symbol: a detached launch
+   * must be a first-class pipe so its stages, `divertsTo`, and failures are
+   * visible on the wiring graph — a closure-shaped detached surface would
+   * reintroduce exactly the invisible side effect this primitive exists to
+   * replace (decision (b): no closure-shaped detached surface). For an inline
+   * transform/effect that stays on the *current* token, use `.map`/`.effect`
+   * (those are synchronous to the pipe's progress); `.spawn` spawns a second
+   * token.
+   *
+   * Optional leading `meta` ({@link StageMeta}) — same arity-based dispatch as
+   * `.map`/`.effect`/`.fork`; its `note` also becomes the error-sink `source`
+   * label if the branch fails (falling back to `'fork.untracked'`).
+   */
+  spawn(branch: ForkBranch<Cursor, unknown>): PipeBuilder<Input, Cursor>;
+  spawn(meta: StageMeta, branch: ForkBranch<Cursor, unknown>): PipeBuilder<Input, Cursor>;
+  spawn(
+    first: StageMeta | ForkBranch<Cursor, unknown>,
+    second?: ForkBranch<Cursor, unknown>,
+  ): PipeBuilder<Input, Cursor> {
+    const meta = second === undefined ? undefined : (first as StageMeta);
+    const branch = (second === undefined ? first : second) as ForkBranch<never, unknown>;
+    // `fork([], [branch])` semantics, but forward the cursor unchanged.
+    return this.#forkStage([], fixedArity(0), meta, [sealBranch(branch)], true) as PipeBuilder<Input, Cursor>;
   }
 
   /**
@@ -629,12 +923,44 @@ export class PipeBuilder<in Input, out Cursor> {
    * do, plus the parent thread — every span a branch's stages mint nests
    * under whatever this fork stage's own invocation nested under, same as any
    * other stage in the enclosing pipe.
+   *
+   * `untracked` branches (the second array of `fork([tracked], [untracked])`,
+   * or the sole branch of `.spawn`) are fired **detached**: `void
+   * kernel.runStages(...)` — never awaited, so they outlive this stage; a
+   * rejection is caught locally and routed to the kernel error sink
+   * (`kernel.reportDetached(source, error)`), so it can neither reject the
+   * tracked `Promise.all` nor surface as an unhandled promise rejection. They
+   * receive the **same** `parentSpan` as the tracked branches, so their spans
+   * still nest under the forking invoke even though they run past its return
+   * (a late child under an already-recorded parent — fine for the flat trace
+   * ring). `forwardCursor` is `.spawn`'s single difference: the stage's own
+   * output is the incoming `value` (cursor unchanged) rather than the tracked
+   * results array.
    */
   #forkStage(
     pipes: readonly Pipe<unknown, unknown>[],
     branchArity: BranchArity,
     meta?: StageMeta,
+    untracked: readonly Pipe<unknown, unknown>[] = [],
+    forwardCursor = false,
   ): PipeBuilder<Input, unknown> {
+    // A fork stage has no `divertsTo` of its own, but its branches are
+    // sub-`Pipe`s that can each carry typed declarations — those must not
+    // become invisible to `KernelBuilder.build()`'s assertion just because
+    // they sit one level down. Stamping the union here (deduplicated) is
+    // what lets `Pipe.declaredTypedDivertKeys`'s single flat walk see every
+    // level of fork nesting without itself recursing into `branches`.
+    // Untracked branches are included: a typed divert declared inside a
+    // detached branch still needs its key bound via `flow()` (and its
+    // build()-time assertion), same as a tracked one.
+    const typedDivertKeys = [
+      ...new Set([...pipes, ...untracked].flatMap((pipe) => pipe.declaredTypedDivertKeys)),
+    ];
+    // The error-sink `source` label for a detached branch failure — the fork's
+    // own `note` when it has one, else a generic tag (a detached branch has no
+    // symbol id of its own to name it).
+    const detachedSource = meta?.note ?? 'fork.untracked';
+    const untrackedBranches = untracked.map((pipe) => pipe.descriptors);
     return this.#appending({
       descriptor: {
         kind: 'fork(branches)',
@@ -642,9 +968,25 @@ export class PipeBuilder<in Input, out Cursor> {
         divertsTo: [],
         branches: pipes.map((pipe) => pipe.descriptors),
         branchArity,
+        // Absent (not empty) when there are no untracked branches — matches
+        // how `branches` is absent on a non-fork stage.
+        ...(untrackedBranches.length > 0 ? { untrackedBranches } : {}),
       },
-      run: async (kernel, value, parentSpan) =>
-        next(await Promise.all(pipes.map((pipe) => kernel.runStages(pipe.erasedStages, value, parentSpan)))),
+      typedDivertKeys: typedDivertKeys.length > 0 ? typedDivertKeys : undefined,
+      run: async (kernel, value, parentSpan) => {
+        // Detached: fired, never awaited — a rejection is caught here and
+        // reported to the kernel error sink, so it cannot reject the tracked
+        // join nor become an unhandled rejection.
+        for (const branch of untracked) {
+          void kernel
+            .runStages(branch.erasedStages, value, parentSpan)
+            .catch((error: unknown) => kernel.reportDetached(detachedSource, error));
+        }
+        const tracked = await Promise.all(
+          pipes.map((pipe) => kernel.runStages(pipe.erasedStages, value, parentSpan)),
+        );
+        return next(forwardCursor ? value : tracked);
+      },
     });
   }
 
@@ -683,12 +1025,21 @@ function handlerNameOf(handler: unknown): string | undefined {
  *   Nothing pins `P` here (unlike `.pipe(meta, fn)`, where the chain fixes
  *   the cursor), so the lambda's parameters must be annotated:
  *   `pipeline({ note: 'guard' }, (kernel: Kernel, n: number) => …)`.
+ * - `pipeline(typedMeta, typedVerbFn)` — the checked-divert twin, exactly
+ *   mirroring `.pipe`'s third shape (see that method's own doc comment): a
+ *   `DivertTargets` map instead of a free-string array, and a third `diverts`
+ *   parameter on the closure. Same annotation caveat as the plain
+ *   `pipeline(meta, verbFn)` shape — nothing pins `P` at the entry point.
  */
 export function pipeline<P, O>(symbol: KernelSymbol<P, O>): PipeBuilder<P, O>;
 export function pipeline<P, O>(meta: VerbStageMeta, stage: VerbStageFn<P, O>): PipeBuilder<P, O>;
+export function pipeline<P, O, T extends DivertTargets>(
+  meta: TypedVerbStageMeta<T>,
+  stage: TypedVerbStageFn<P, O, T>,
+): PipeBuilder<P, O>;
 export function pipeline<P, O>(
-  first: KernelSymbol<P, O> | VerbStageMeta,
-  stage?: VerbStageFn<P, O>,
+  first: KernelSymbol<P, O> | VerbStageMeta | TypedVerbStageMeta<DivertTargets>,
+  stage?: VerbStageFn<P, O> | TypedVerbStageFn<P, O, DivertTargets>,
 ): PipeBuilder<P, O> {
   if ('id' in first) {
     const sym = first;
@@ -699,6 +1050,25 @@ export function pipeline<P, O>(
       },
     ]);
   }
+  if (first.divertsTo !== undefined && !Array.isArray(first.divertsTo)) {
+    const targets = first.divertsTo as DivertTargets;
+    const fn = stage as TypedVerbStageFn<unknown, unknown, DivertTargets>;
+    const handlerName = handlerNameOf(fn);
+    const divertsTo = Object.values(targets).map((key) => key.key);
+    const channel = buildDivertChannel(targets);
+    return new PipeBuilder<P, O>([
+      {
+        descriptor: {
+          kind: handlerName === undefined ? 'pipe(closure)' : 'pipe(function)',
+          note: first.note,
+          divertsTo,
+          handlerName,
+        },
+        typedDivertKeys: divertsTo,
+        run: (kernel, value) => fn(kernel, value, channel),
+      },
+    ]);
+  }
   const fn = stage as VerbStageFn<unknown, unknown>;
   const handlerName = handlerNameOf(fn);
   return new PipeBuilder<P, O>([
@@ -706,7 +1076,7 @@ export function pipeline<P, O>(
       descriptor: {
         kind: handlerName === undefined ? 'pipe(closure)' : 'pipe(function)',
         note: first.note,
-        divertsTo: first.divertsTo ?? [],
+        divertsTo: (first.divertsTo as readonly string[] | undefined) ?? [],
         handlerName,
       },
       run: (kernel, value) => fn(kernel, value),

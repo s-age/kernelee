@@ -1,10 +1,12 @@
 export { symbol, type KernelSymbol } from './symbol.js';
+export { dispatchKey, type DispatchKey } from './dispatch-key.js';
 export {
   next,
   abort,
   divert,
   fail,
   diversion,
+  keyedDiversion,
   type Verb,
   type Diversion,
   type ErasedStage,
@@ -24,10 +26,14 @@ export {
   fixedArity,
   runtimeArity,
   type BranchArity,
+  type DivertChannel,
+  type DivertTargets,
   type ForkBranch,
   type StageDescriptor,
   type StageKind,
   type StageMeta,
+  type TypedVerbStageFn,
+  type TypedVerbStageMeta,
   type VerbStageFn,
   type VerbStageMeta,
 } from './pipe.js';

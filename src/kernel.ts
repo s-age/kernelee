@@ -1,11 +1,13 @@
 import type { KernelSymbol } from './symbol.js';
 import type { Action } from './action.js';
 import type { Pipe, PipeBuilder } from './pipe.js';
+import type { DispatchKey } from './dispatch-key.js';
 import { next, type ErasedStage, type Verb } from './verb.js';
 import { mintSpan, type Span } from './span.js';
 import { CommandBus } from './command-bus.js';
 import { Buffer, BufferBuilder, KernelErrorState } from './buffer.js';
 import { appendTraceEntry, describeTracePayload, TraceState, type TraceSink } from './trace.js';
+import { describePipe, type PipeDescriptorEntry } from './wiring-graph.js';
 
 // MARK: - KernelError
 
@@ -18,14 +20,22 @@ export type KernelErrorCode = 'unbound' | 'duplicate';
  * untouched; these codes are the only failures the *kernel itself* produces,
  * and both mark a wiring-time programming error rather than a runtime input:
  * catch them to distinguish "the machinery is miswired" from "the operation
- * failed".
+ * failed". Each code covers both of the kernel's name→entity tables — the
+ * handler table (`KernelSymbol.id` → handler, written by `register`) and the
+ * flow table (`DispatchKey.key` → pipe stages, written by `flow`) — because
+ * the two tables share one failure shape: a name with no binding, or a name
+ * bound twice.
  *
- * - `'unbound'` — no handler was wired for the symbol id (a forgotten
- *   `register`). Mirrors Swift `KernelError.unbound`.
- * - `'duplicate'` — a second `register` for an already-bound symbol id.
- *   Swift traps this with a `precondition`; TS has no process-trapping
- *   precondition, so the same programming error surfaces as an immediate
- *   throw at the second bind.
+ * - `'unbound'` — no binding was wired for the name: no handler for a symbol
+ *   id at `invoke` (a forgotten `register` — mirrors Swift
+ *   `KernelError.unbound`), or no flow for a dispatch key when a key-form
+ *   `divert` resolves (a forgotten `flow`, on a pipe whose typed declaration
+ *   `build()`'s assertion couldn't see — see `Kernel.#resolveFlowKey`).
+ * - `'duplicate'` — a second binding for an already-bound name: a second
+ *   `register` for a symbol id, or a second `flow()` for a dispatch key.
+ *   Swift traps the symbol case with a `precondition`; TS has no
+ *   process-trapping precondition, so the same programming error surfaces as
+ *   an immediate throw at the second bind.
  *
  * Swift's `composeTypeMismatch` has no counterpart here: TS generics are
  * fully erased, so the terminator boundary cast is unchecked (see
@@ -34,7 +44,15 @@ export type KernelErrorCode = 'unbound' | 'duplicate';
 export class KernelError extends Error {
   override readonly name = 'KernelError';
   readonly code: KernelErrorCode;
-  /** The symbol id the failure is about — the caller already holds it. */
+  /**
+   * The id the failure is about — the caller already holds it. For
+   * symbol-related failures (`register` collisions, unbound `invoke`) this
+   * is the `KernelSymbol.id`; for flow-related failures (`flow` collisions,
+   * an unbound key-form `divert`) it carries the `DispatchKey.key` instead.
+   * The field keeps its original name — renaming it for the flow case would
+   * break the public API for no information gained; both are the one dotted
+   * name the failing lookup used.
+   */
   readonly symbolId: string;
 
   constructor(code: KernelErrorCode, symbolId: string, message: string) {
@@ -66,15 +84,22 @@ export type ErasedHandler = (kernel: Kernel, payload: unknown) => Promise<Verb<u
 /** Options frozen into the kernel by `KernelBuilder.build`. */
 export interface KernelBuildOptions {
   /**
-   * Sink for failures of fire-and-forget commands (`Kernel.dispatch`).
-   * `symbolId` is the id of the dispatched command that failed — the caller
-   * already holds it, so it travels alongside the error rather than being
-   * dropped. Omitted, failures are rendered into the buffer's
-   * `KernelErrorState` cell as `"symbolId: message"` (Swift's
+   * Sink for the two kinds of fire-and-forget failure the kernel owns:
+   * a failed `Kernel.dispatch` command, and a failed **untracked (detached)
+   * fork branch** (`fork([tracked], [untracked])` / `.spawn` — routed here by
+   * `Kernel.reportDetached`). `source` names what failed: the dispatched
+   * command's symbol id, or a detached branch's label (the fork stage's
+   * `note`, else `'fork.untracked'`). Omitted, failures are rendered into the
+   * buffer's `KernelErrorState` cell as `"source: message"` (Swift's
    * `defaultErrorSink`); an injected sink replaces that default entirely —
    * `KernelErrorState` then stays untouched.
+   *
+   * That a detached branch's failure lands here is the *structural* resolution
+   * of the old "`kernel.run(pipe)` has no error sink" residue: a fire-and-
+   * forget launch no longer needs a hand-rolled `void ….catch(…)` — its
+   * failure has a first-class home, replaceable per app via this option.
    */
-  onError?: (symbolId: string, error: unknown) => void;
+  onError?: (source: string, error: unknown) => void;
   /**
    * The buffer wiring — the state-side counterpart of this builder. `build`
    * freezes it (`BufferBuilder.build()`, which seeds `KernelErrorState`, plus
@@ -135,6 +160,19 @@ function isComposing(handler: (...args: never[]) => unknown): boolean {
  */
 export class KernelBuilder {
   #handlers = new Map<string, ErasedHandler>();
+  /** `DispatchKey.key` → the bound pipe's `erasedStages` — what `flow` writes and `Kernel`'s divert resolution reads. */
+  #flows = new Map<string, readonly ErasedStage[]>();
+  /** `describePipe(key.key, title, pipe, note)` per `flow` call, in call order — the catalog `flowCatalog` hands back. */
+  #flowCatalog: PipeDescriptorEntry[] = [];
+  /**
+   * One entry per `flow` call: the key it bound plus that call's pipe's own
+   * `declaredTypedDivertKeys` — exactly the two things `build()`'s assertion
+   * needs (which typed keys exist to check, and which flow(s) to name in the
+   * error if one is missing). Recorded at `flow` time rather than re-derived
+   * at `build` time so the assertion doesn't need to keep the `Pipe` values
+   * themselves around after registration.
+   */
+  #flowDeclarations: { readonly flowKey: string; readonly typedDivertKeys: readonly string[] }[] = [];
 
   /**
    * The set of symbol ids currently bound. Read after wiring (before `build`)
@@ -238,6 +276,119 @@ export class KernelBuilder {
   }
 
   /**
+   * The catalog of every `Pipe` bound through `flow` so far, in call order —
+   * `describePipe(key.key, title, pipe, note)` per call, ready to hand to
+   * `projectWiringGraph` alongside `boundSymbolIds`. Since `flow` builds this
+   * catalog entry *and* the flow-table binding from one call, a flow-bound
+   * pipe can never be wired without also being catalogued (see `flow`'s own
+   * doc comment on the direction-of-truth flip this produces).
+   */
+  get flowCatalog(): readonly PipeDescriptorEntry[] {
+    return [...this.#flowCatalog];
+  }
+
+  /** The set of `DispatchKey.key`s currently bound via `flow` — the divert-side twin of `boundSymbolIds`. */
+  get boundFlowKeys(): ReadonlySet<string> {
+    return new Set(this.#flows.keys());
+  }
+
+  /**
+   * Bind a `DispatchKey` to the `Pipe` that answers it — the single call
+   * that gives typed divert targets the same two-part treatment `register`
+   * already gives symbols: a typed token (`DispatchKey<P>`, checked by
+   * `tsc` against `pipe`'s own `Input`) plus a kernel-level binding (the
+   * key's string written into the flow table `Kernel.runStages`/`#interpret`
+   * resolve a key-form `divert` against — see `kernel.ts`'s
+   * `#resolveFlowKey`).
+   *
+   * One call does **both** of the two things a divert target used to need,
+   * separately, with nothing forcing them to agree: it writes
+   * `key.key → pipe.erasedStages` into the flow-binding table, *and* it
+   * records a `PipeDescriptorEntry` (`describePipe(key.key, title, pipe,
+   * note)`) into `flowCatalog`. `describePipe`'s own signature was always,
+   * in effect, a `(key, pipe)` pair — a binder wearing a cataloguing hat;
+   * merging the two here means catalog completeness stops being a discipline
+   * (remembering to also call `describePipe` for every flow) and becomes a
+   * structural guarantee (there is no way to bind a flow without
+   * cataloguing it). The direction of truth flips accordingly: the catalog
+   * used to be a parallel, hand-maintained transcription of what was wired;
+   * now it is *derived* from the binding table, the same relationship
+   * `boundSymbolIds` already has to the handler table.
+   *
+   * Double `flow()` on the same key throws — the same collision discipline
+   * as `#bind`'s duplicate `register` (see that method's own doc comment):
+   * two bindings for one key would silently last-write-win, and which pipe
+   * answers a key is the runtime half of this feature's guarantee, so a
+   * duplicate throws immediately at the second call (where the stack names
+   * the offender) rather than surfacing as the wrong pipe answering on some
+   * cold divert path.
+   *
+   * **Alternative considered and rejected**: auto-registering a flow the
+   * moment its `DispatchKey` is minted (a `seal(key)`-style module-level
+   * table, mirroring how `dispatchKey`/`symbol` themselves need no builder
+   * call to exist) was rejected for the same reason `callable.ts`'s
+   * `mintedCallableIds` deliberately stays a collision ledger and not a
+   * readable registry: import order is not guaranteed, so at any given
+   * `build()` call "this key was never bound" and "this key's binding module
+   * just hasn't been imported yet" are indistinguishable — a registry built
+   * that way can only ever report "not seen *yet*", never "not bound",
+   * which is exactly the distinction `build()`'s typed-divert assertion (see
+   * below) needs to be trustworthy. Requiring an explicit `flow()` call,
+   * collected into *this* builder before *this* `build()` runs, keeps the
+   * assertion meaningful: wiring is finished before the first call can
+   * happen, same as `register`/`#bind`.
+   */
+  flow<P>(key: DispatchKey<P>, title: string, pipe: Pipe<P, any>, note?: string): void {
+    if (this.#flows.has(key.key)) {
+      throw new KernelError('duplicate', key.key, `Dispatch key '${key.key}' is already bound — duplicate flow`);
+    }
+    this.#flows.set(key.key, pipe.erasedStages);
+    this.#flowCatalog.push(describePipe(key.key, title, pipe, note));
+    this.#flowDeclarations.push({ flowKey: key.key, typedDivertKeys: pipe.declaredTypedDivertKeys });
+  }
+
+  /**
+   * `build()`'s typed-divert completeness check: every typed key any
+   * registered flow's pipe declared (`Pipe.declaredTypedDivertKeys`, which
+   * already folds in fork-branch declarations — see that getter's own doc
+   * comment) must itself be a key some `flow()` call bound. A typed
+   * declaration with no matching binding would otherwise only surface as a
+   * runtime "unknown key" throw (`Kernel`'s `#resolveFlowKey`) the first
+   * time that particular branch of a closure actually runs — this turns it
+   * into a `build()`-time failure instead, naming both the missing key and
+   * every flow that declared it.
+   *
+   * **Honest ceiling**: this only sees typed declarations reachable from a
+   * pipe that was itself registered via `flow()`. A `pipe(typedMeta, fn)`
+   * built and used (e.g. via `kernel.compose`) without ever being handed to
+   * `flow()` has its typed declarations invisible here — there is no
+   * registry of "every `Pipe` ever constructed" to walk (the same reason
+   * `describePipe` itself needs a hand-built catalog array, not an
+   * enumerable one; see `wiring-graph.ts`). The runtime unknown-key throw in
+   * `Kernel` is that case's safety net: a *typo'd or unbound* key still
+   * cannot silently succeed, it just fails at first use instead of at
+   * `build()`.
+   */
+  #assertTypedDivertKeysAreBound(): void {
+    const unboundDeclarers = new Map<string, string[]>();
+    for (const { flowKey, typedDivertKeys } of this.#flowDeclarations) {
+      for (const typedKey of typedDivertKeys) {
+        if (this.#flows.has(typedKey)) continue;
+        const declarers = unboundDeclarers.get(typedKey) ?? [];
+        declarers.push(flowKey);
+        unboundDeclarers.set(typedKey, declarers);
+      }
+    }
+    if (unboundDeclarers.size === 0) return;
+    const detail = [...unboundDeclarers.entries()]
+      .map(([key, declarers]) => `'${key}' (declared by ${declarers.map((d) => `'${d}'`).join(', ')})`)
+      .join('; ');
+    throw new Error(
+      `KernelBuilder.build(): typed divert key(s) declared but never bound via KernelBuilder.flow(...): ${detail}`,
+    );
+  }
+
+  /**
    * Freeze the bindings into an immutable `Kernel`. The builder itself stays
    * usable, but the kernel takes a snapshot — later registers do not leak
    * into an already-built kernel.
@@ -248,8 +399,12 @@ export class KernelBuilder {
    * monitor states existing only in DEBUG builds. The allocate happens here,
    * before the buffer freezes, since `KernelBuildOptions.tracing` is only
    * known at this call, not to `BufferBuilder` itself.
+   *
+   * Also runs `#assertTypedDivertKeysAreBound` — see that method's own doc
+   * comment for exactly what it does and does not catch.
    */
   build(options: KernelBuildOptions = {}): Kernel {
+    this.#assertTypedDivertKeysAreBound();
     const bufferBuilder = options.buffer ?? new BufferBuilder();
     const tracing = options.tracing ?? false;
     if (tracing) {
@@ -258,20 +413,22 @@ export class KernelBuilder {
     const buffer = bufferBuilder.build();
     const onError = options.onError ?? KernelBuilder.#defaultErrorSink(buffer);
     const onTrace = tracing ? (options.onTrace ?? KernelBuilder.#defaultTraceSink(buffer, options.traceCap ?? 300)) : undefined;
-    return new Kernel(new Map(this.#handlers), onError, buffer, onTrace);
+    return new Kernel(new Map(this.#handlers), onError, buffer, new Map(this.#flows), onTrace);
   }
 
   /**
    * The error sink `build` falls back to when the caller injects none: render
-   * the failed command's symbol id and error message into `KernelErrorState`.
-   * Swift's `defaultErrorSink`, verbatim (`"\(symbol): \(error.localizedDescription)"`
-   * becomes `"symbolId: message"`) — `dispatch` swallows the error either way,
-   * and a silently dropped failure is the worse default.
+   * the failed `source` (a dispatched command's symbol id, or a detached fork
+   * branch's label — see {@link KernelBuildOptions.onError}) and the error
+   * message into `KernelErrorState`. Swift's `defaultErrorSink`, verbatim
+   * (`"\(symbol): \(error.localizedDescription)"` becomes `"source: message"`)
+   * — both `dispatch` and a detached branch swallow the error toward this sink
+   * either way, and a silently dropped failure is the worse default.
    */
-  static #defaultErrorSink(buffer: Buffer): (symbolId: string, error: unknown) => void {
-    return (symbolId, error) => {
+  static #defaultErrorSink(buffer: Buffer): (source: string, error: unknown) => void {
+    return (source, error) => {
       const message = error instanceof Error ? error.message : String(error);
-      buffer.mutate(KernelErrorState, () => ({ message: `${symbolId}: ${message}` }));
+      buffer.mutate(KernelErrorState, () => ({ message: `${source}: ${message}` }));
     };
   }
 
@@ -308,8 +465,12 @@ export class Kernel {
    * handler's dispatch and a top-level dispatch land on the same chain.
    */
   readonly #commands: CommandBus;
-  /** Where a dispatched command's failure goes — frozen by `build`. */
-  readonly #errorSink: (symbolId: string, error: unknown) => void;
+  /**
+   * Where a fire-and-forget failure goes — a failed `dispatch` command or a
+   * failed detached fork branch (via {@link reportDetached}) — frozen by
+   * `build`. `source` is the command's symbol id or the branch's label.
+   */
+  readonly #errorSink: (source: string, error: unknown) => void;
   /**
    * The observable-state region this kernel writes into — frozen by `build`
    * (from `KernelBuildOptions.buffer`, or an empty default). Handlers and
@@ -317,6 +478,17 @@ export class Kernel {
    * present, always holding at least `KernelErrorState`.
    */
   readonly buffer: Buffer;
+  /**
+   * `DispatchKey.key` → the bound pipe's `erasedStages` — the frozen
+   * snapshot of every `KernelBuilder.flow` registration, threaded through
+   * from `build()` the same way `#handlers` is. `#resolveFlowKey` is the
+   * only reader: a key-form `Verb.divert` (`{ key, payload }`) resolves
+   * against this table at the moment `#interpret`/`runStages` interprets it,
+   * not at the pipe's own construction time — so a pipe can declare (via its
+   * typed `divertsTo` channel) a divert to a flow bound *anywhere*,
+   * including one registered after that pipe was built.
+   */
+  readonly #flows: ReadonlyMap<string, readonly ErasedStage[]>;
   /**
    * Trace sink. `undefined` unless
    * `KernelBuildOptions.tracing` was on at `build` — off, `invoke` skips the
@@ -338,8 +510,9 @@ export class Kernel {
   /** @internal Construct via `KernelBuilder.build()`, never directly. */
   constructor(
     handlers: ReadonlyMap<string, ErasedHandler>,
-    errorSink: (symbolId: string, error: unknown) => void,
+    errorSink: (source: string, error: unknown) => void,
     buffer: Buffer,
+    flows: ReadonlyMap<string, readonly ErasedStage[]>,
     onTrace?: TraceSink,
     ambientSpan?: Span,
     commands?: CommandBus,
@@ -347,6 +520,7 @@ export class Kernel {
     this.#handlers = handlers;
     this.#errorSink = errorSink;
     this.buffer = buffer;
+    this.#flows = flows;
     this.#onTrace = onTrace;
     this.#ambientSpan = ambientSpan;
     this.#commands = commands ?? new CommandBus();
@@ -356,13 +530,43 @@ export class Kernel {
    * A view of this kernel whose public entry points (`call`/`dispatch`/
    * `compose`/`run`) parent their spans under `span` instead of minting flow
    * roots. Shares every piece of live state — handler table, command bus,
-   * buffer, error/trace sinks — so it *is* this kernel for every purpose
-   * except span parentage. `invoke` hands one to each handler it runs, which
-   * is what links a handler's own call-backs to the handler's span
-   * (span linking; see [[span.ts]]).
+   * buffer, error/trace sinks, flow table — so it *is* this kernel for every
+   * purpose except span parentage. `invoke` hands one to each handler it
+   * runs, which is what links a handler's own call-backs to the handler's
+   * span (span linking; see [[span.ts]]).
    */
   #scoped(span: Span): Kernel {
-    return new Kernel(this.#handlers, this.#errorSink, this.buffer, this.#onTrace, span, this.#commands);
+    return new Kernel(this.#handlers, this.#errorSink, this.buffer, this.#flows, this.#onTrace, span, this.#commands);
+  }
+
+  /**
+   * Resolve a key-form `Diversion`'s `key` against the flow table — the one
+   * lookup point both `#interpret`'s `divert` case and `runStages`' `divert`
+   * branch funnel through, so "unknown key" is phrased once rather than
+   * duplicated at each call site. A miss here means the key was never bound
+   * via `KernelBuilder.flow(...)` in *this* kernel's builder — either a typo,
+   * a genuinely unbound `DispatchKey`, or (for a pipe that was never
+   * registered via `flow()` at all — see that method's own "honest ceiling"
+   * note) the one case `build()`'s typed-divert assertion cannot see ahead
+   * of time. Either way this throw is the safety net for it — and it is a
+   * `KernelError('unbound', …)`, not a plain `Error`: an unknown divert key
+   * is exactly the "machinery is miswired, never a runtime input" class
+   * that vocabulary exists for, the flow-table twin of `invoke`'s own
+   * unbound-symbol throw (see `KernelError`'s doc comment on `'unbound'`
+   * covering both tables). `build()`'s typed-divert assertion, by contrast,
+   * stays a plain `Error`: that one is a build-time invariant violation,
+   * not a dispatch failure.
+   */
+  #resolveFlowKey(key: string): readonly ErasedStage[] {
+    const stages = this.#flows.get(key);
+    if (stages === undefined) {
+      throw new KernelError(
+        'unbound',
+        key,
+        `divert: dispatch key '${key}' was never bound via KernelBuilder.flow(...)`,
+      );
+    }
+    return stages;
   }
 
   /**
@@ -513,6 +717,31 @@ export class Kernel {
   }
 
   /**
+   * Route a detached (untracked fork branch / `.spawn`) failure to the same
+   * `#errorSink` a failed `dispatch` uses — the single funnel that turns a
+   * fire-and-forget failure into either an injected `onError` call or the
+   * default `KernelErrorState` write. `source` is the branch's label (the
+   * fork stage's `note`, else `'fork.untracked'`).
+   *
+   * @internal Called only by `PipeBuilder`'s fork stage, from the `.catch`
+   * on a detached branch's `runStages` promise — the reason the fork stage
+   * must funnel through the kernel (it holds the sink) rather than sink the
+   * error itself. The sink call is guarded: a throwing sink must not turn a
+   * detached-branch failure into an unhandled rejection (the same "the bus
+   * only sequences; a throwing sink can't poison it" safety net `CommandBus`
+   * keeps — see `command-bus.ts`). This is the counterpart of Swift routing a
+   * detached `Task {}`'s error to its own `errorSink`.
+   */
+  reportDetached(source: string, error: unknown): void {
+    try {
+      this.#errorSink(source, error);
+    } catch {
+      // A broken sink is a wiring bug, but swallowing it here is strictly
+      // better than an unhandled rejection escaping a devtools-only path.
+    }
+  }
+
+  /**
    * Interpret a single verb down to a typed result — the terminal step shared
    * by `call` (a one-stage pipe) and `compose`'s terminators.
    * `next`/`abort` yield their value; `divert` runs the other pipe (via the
@@ -530,7 +759,7 @@ export class Kernel {
         return verb.value as O;
       case 'abort':
         return verb.value as O;
-      case 'divert':
+      case 'divert': {
         // Runs under this instance's *own* ambient span (`undefined` on the
         // built kernel): by interpret time the handler that returned this
         // divert has already closed its span, so the diverted-to stages
@@ -538,7 +767,16 @@ export class Kernel {
         // traced's ambient has reverted to the caller's binding when
         // interpret runs (it only wraps invoke's handler call, not the
         // interpretation that follows it).
-        return (await this.runStages(verb.diversion.stages, verb.diversion.payload, this.#ambientSpan)) as O;
+        //
+        // Two `Diversion` shapes (see that type's own doc comment): the
+        // unchecked `{ stages, payload }` resolves for free (it already
+        // carries its stages); the checked `{ key, payload }` resolves
+        // against the flow table via `#resolveFlowKey` — a plain map lookup,
+        // not a recursive `compose`, so this stays exactly as O(1)-stack as
+        // the stages form.
+        const stages = 'key' in verb.diversion ? this.#resolveFlowKey(verb.diversion.key) : verb.diversion.stages;
+        return (await this.runStages(stages, verb.diversion.payload, this.#ambientSpan)) as O;
+      }
       case 'fail':
         throw verb.error;
     }
@@ -575,6 +813,13 @@ export class Kernel {
    * signature and so has no parameter to carry
    * a parent through. `compose`/`run` call it as their unexported-typed
    * implementation.
+   *
+   * `divert`'s key-form resolution (`#resolveFlowKey`) sits right here,
+   * inline in the same `switch` as the stages form — both replace
+   * `stages`/`value` and reset `index` to `0` identically, so a key-form
+   * divert costs the same one map lookup whether it is hop 1 or hop
+   * 100,000 of a self-diverting loop; there is no extra frame either shape
+   * adds.
    */
   async runStages(initialStages: readonly ErasedStage[], initialPayload: unknown, parentSpan?: Span): Promise<unknown> {
     let stages = initialStages;
@@ -591,7 +836,7 @@ export class Kernel {
         case 'abort':
           return verb.value;
         case 'divert':
-          stages = verb.diversion.stages;
+          stages = 'key' in verb.diversion ? this.#resolveFlowKey(verb.diversion.key) : verb.diversion.stages;
           value = verb.diversion.payload;
           index = 0;
           break;

@@ -11,7 +11,7 @@ See it in action:
 Game of Life driving the generation loop with `divert` and parallel row
 chunks with `fork`.
 
-![The devtools-bridge panel rendering lifegame's Randomize pipe as a node graph — fork branches, map/effect stages and symbol endpoints, all read statically from Pipe.descriptors](https://raw.githubusercontent.com/s-age/kernelee/master/docs/wiring-panel.png)
+![The devtools-bridge panel rendering lifegame's generation loop (tickLoop) as a node graph — the granularity fork's chunk branches converging back into map(mergeGranularityBranches), a nested stats fork, map/effect stages and symbol endpoints, all read statically from Pipe.descriptors](https://raw.githubusercontent.com/s-age/kernelee/master/docs/wiring-panel.png)
 
 *Every flow above is a `Pipe` value — the
 [devtools panel](https://github.com/s-age/kernelee-devtools-bridge) renders
