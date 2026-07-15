@@ -202,6 +202,14 @@ export class KernelBuilder {
   }
 
   /**
+   * @internal Not part of the public API — stripped from the emitted `.d.ts`
+   * (`stripInternal`). App code binds through {@link defineCallable}'s
+   * `port`/`portK` markers, whose synthesized closures fix the leaf/composing
+   * arity by construction; this raw overload leans on the `fn.length`
+   * discrimination below (see {@link isComposing}), which default/rest
+   * parameters silently break. Kept public-at-runtime only for `wire` and
+   * kernelee's own tests.
+   *
    * Bind a *value-returning* handler. The plain return is implicitly the
    * `next` verb.
    *
@@ -230,7 +238,9 @@ export class KernelBuilder {
    * compile errors; only the inference is lost.
    */
   register<P, O>(sym: KernelSymbol<P, O>, handler: (payload: P) => O | Promise<O>): void;
+  /** @internal */
   register<P, O>(sym: KernelSymbol<P, O>, handler: (kernel: Kernel, payload: P) => O | Promise<O>): void;
+  /** @internal */
   register<P, O>(
     sym: KernelSymbol<P, O>,
     handler: ((payload: P) => O | Promise<O>) | ((kernel: Kernel, payload: P) => O | Promise<O>),
@@ -245,6 +255,10 @@ export class KernelBuilder {
   }
 
   /**
+   * @internal Not part of the public API — stripped from the emitted `.d.ts`
+   * (`stripInternal`), same rationale as {@link register}: bind through
+   * {@link defineCallable}'s `portV`/`portKV` markers, not this raw overload.
+   *
    * Bind a *verb-returning* handler — one that owns its own pipeline control:
    * it answers `next`/`abort`/`divert`/`fail` directly instead of a bare
    * value. In a pipe its verb drives the flow (e.g. a fetch that
@@ -259,7 +273,9 @@ export class KernelBuilder {
    * separate name.)
    */
   registerVerb<P, O>(sym: KernelSymbol<P, O>, handler: (payload: P) => Verb<O> | Promise<Verb<O>>): void;
+  /** @internal */
   registerVerb<P, O>(sym: KernelSymbol<P, O>, handler: (kernel: Kernel, payload: P) => Verb<O> | Promise<Verb<O>>): void;
+  /** @internal */
   registerVerb<P, O>(
     sym: KernelSymbol<P, O>,
     handler:
@@ -664,20 +680,52 @@ export class Kernel {
    * at kernel construction (CommandBus.swift:19-25) and so loses dispatch
    * parentage; here the truthful causal link is free, and cross-platform
    * trace comparisons should expect TS to nest what Swift shows as a root.
+   *
+   * **Returns the dispatched flow's root `Span`** — minted synchronously,
+   * before the serial bus defers the enqueued work — so the caller has a
+   * correlation handle in hand the instant `dispatch` returns. Feed
+   * `span.id` to the runtime-trace surface's `flow` filter (`arch_monitor`)
+   * to isolate exactly the entries this one dispatch produced. The span is
+   * only *meaningful* while tracing is on: with tracing off it correlates to
+   * nothing, since nothing is recorded (see below). With tracing on, this
+   * span itself carries no trace entry of its own — it is a synthetic root
+   * that the command's first `invoke` mints a *child* of, so a dispatched
+   * flow now nests one level deeper than it did before this span was
+   * introduced: `dispatch`'s returned span is the parent every entry that
+   * flow produces ultimately roots at, not an entry itself.
+   *
+   * Backward compatible: callers that treated `dispatch` as `void` are
+   * unaffected — they simply discard a return value they never asked for.
+   *
+   * Cross-platform: Swift's `dispatch` returns `void`; returning the root
+   * span here is a deliberate TS-side divergence, consistent with the
+   * parentage note above — TS `dispatch` already links causally where Swift
+   * cannot, and now it also hands back the correlation handle for it.
    */
-  dispatch<P, O>(sym: KernelSymbol<P, O>, payload: P): void;
-  dispatch<P, O>(action: Action<P, O>): void;
-  dispatch<P, O>(target: KernelSymbol<P, O> | Action<P, O>, payload?: P): void {
+  dispatch<P, O>(sym: KernelSymbol<P, O>, payload: P): Span;
+  dispatch<P, O>(action: Action<P, O>): Span;
+  dispatch<P, O>(target: KernelSymbol<P, O> | Action<P, O>, payload?: P): Span {
     const isAction = 'sym' in target;
     const sym = isAction ? target.sym : target;
     const p = isAction ? target.payload : (payload as P);
+    // Mint the flow's root span synchronously (same parent `call` would have
+    // used — `#ambientSpan`, undefined at a top-level dispatch → a true
+    // root), so the caller gets a correlation handle BEFORE the serial bus
+    // defers the work.
+    const span = mintSpan(this.#ambientSpan);
+    // Run the command under `span`. Gated exactly like `invoke`: with tracing
+    // off, spans are unobservable and scoping is skipped, so behaviour is
+    // byte-identical to before this change (the returned span is then an
+    // inert handle that correlates to nothing, because nothing is recorded).
+    const scoped = this.#onTrace === undefined ? this : this.#scoped(span);
     this.#commands.enqueue(async () => {
       try {
-        await this.call(sym, p);
+        await scoped.call(sym, p);
       } catch (error) {
         this.#errorSink(sym.id, error);
       }
     });
+    return span;
   }
 
   /**

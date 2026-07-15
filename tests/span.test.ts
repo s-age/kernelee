@@ -2,10 +2,12 @@ import { expect, test } from 'vitest';
 import {
   divert,
   diversion,
+  fail,
   next,
   pipeline,
   symbol,
   KernelBuilder,
+  TraceState,
   type ErasedStage,
   type Kernel,
   type TraceSink,
@@ -74,15 +76,19 @@ test('a bare kernel.call mints a root span (public entry points carry no parent)
   expect(hits[0]?.symbolId).toBe(increment.id);
 });
 
-test('dispatch mints a root span exactly like call, via the same invoke chokepoint', async () => {
+test('dispatch mints its own root span and returns it; the command nests one level under it', async () => {
   const { hits, onTrace } = spanRecorder();
   const kernel = makeKernel(onTrace);
 
-  kernel.dispatch(increment, 1);
+  const span = kernel.dispatch(increment, 1);
   await new Promise((resolve) => setTimeout(resolve, 0));
 
+  expect(span.parentId).toBeUndefined(); // a top-level dispatch's span is itself a true root
   expect(hits).toHaveLength(1);
-  expect(hits[0]?.span.parentId).toBeUndefined();
+  // The returned span carries no trace entry of its own (it's a synthetic
+  // root) — the command's own invoke mints a child of it, so the recorded
+  // entry's parent is the returned span, not undefined.
+  expect(hits[0]?.span.parentId).toBe(span.id);
 });
 
 // MARK: - Propagation through Kernel.runStages (compose's pipe-stage loop)
@@ -231,10 +237,11 @@ test("a handler's kernel.compose parents every stage under the handler's span", 
 
 test("a handler's kernel.dispatch links the command's span to the handler — beyond Swift, whose drain task cannot", async () => {
   const { hits, onTrace } = spanRecorder();
+  let dispatchedSpan: Span | undefined;
   const builder = new KernelBuilder();
   builder.register(increment, (n: number) => n + 1);
   builder.register(sum, (kernel: Kernel, n: number) => {
-    kernel.dispatch(increment, n);
+    dispatchedSpan = kernel.dispatch(increment, n);
     return n;
   });
   const kernel = builder.build({ tracing: true, onTrace });
@@ -246,8 +253,59 @@ test("a handler's kernel.dispatch links the command's span to the handler — be
   const dispatched = hits.find((h) => h.symbolId === increment.id);
   // The enqueued closure captured the handler's span-scoped kernel, so the
   // linkage survives the bus's deferred execution (see Kernel.dispatch's doc
-  // for why this deliberately exceeds Swift's dispatch behavior).
-  expect(dispatched?.span.parentId).toBe(parent?.span.id);
+  // for why this deliberately exceeds Swift's dispatch behavior). `dispatch`
+  // now mints its own root span first — parented under the handler — and the
+  // command's own invoke nests one level further under *that*.
+  expect(dispatchedSpan?.parentId).toBe(parent?.span.id);
+  expect(dispatched?.span.parentId).toBe(dispatchedSpan?.id);
+});
+
+// MARK: - The `flow` correlation contract (dispatch's returned span as root)
+
+test("dispatch's returned span is the single root every recorded entry's parentId chain walks up to (the arch_monitor `flow` correlation)", async () => {
+  const builder = new KernelBuilder();
+  builder.register(increment, (n: number) => n + 1);
+  builder.register(
+    sum,
+    async (kernel: Kernel, n: number) => (await kernel.call(increment, n)) + (await kernel.call(increment, n)),
+  );
+  const kernel = builder.build({ tracing: true });
+
+  const span = kernel.dispatch(sum, 1);
+  await new Promise((resolve) => setTimeout(resolve, 0)); // drain the command bus
+
+  const { entries } = kernel.buffer.read(TraceState);
+  expect(entries.length).toBeGreaterThan(0);
+  // Walk each entry's parentId chain (through the *other entries'* spans)
+  // until it lands on an id no entry owns — that id must be exactly the
+  // span dispatch returned, since the returned span is a synthetic root
+  // that carries no trace entry of its own.
+  const spanById = new Map(entries.map((e) => [e.span.id, e]));
+  for (const entry of entries) {
+    let cursor: string | undefined = entry.span.parentId;
+    while (cursor !== undefined && spanById.has(cursor)) {
+      cursor = spanById.get(cursor)?.span.parentId;
+    }
+    expect(cursor).toBe(span.id);
+  }
+});
+
+test('with tracing off, dispatch still returns a Span, and fire-and-forget + error-sink behavior is unchanged', async () => {
+  const errors: string[] = [];
+  const boom = symbol<number, void>('span.boomOffTracing');
+  const builder = new KernelBuilder();
+  builder.registerVerb(boom, () => fail(new Error('boom')));
+  builder.register(increment, (n: number) => n + 1);
+  const kernel = builder.build({ onError: (source, error) => errors.push(`${source}:${(error as Error).message}`) }); // tracing defaults off
+
+  const span = kernel.dispatch(increment, 1);
+  expect(span.id).toBeTruthy();
+  expect(span.parentId).toBeUndefined();
+
+  kernel.dispatch(boom, 1);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(errors).toEqual(['span.boomOffTracing:boom']);
 });
 
 test('a scoped kernel dispatches onto the same serial bus as the root kernel (submission order holds across views)', async () => {
