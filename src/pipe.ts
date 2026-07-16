@@ -974,16 +974,27 @@ export class PipeBuilder<in Input, out Cursor> {
       },
       typedDivertKeys: typedDivertKeys.length > 0 ? typedDivertKeys : undefined,
       run: async (kernel, value, parentSpan) => {
+        // Every branch — tracked or untracked — starts a NEW causal flow
+        // (fan-out, concurrent with its siblings and with whatever runs
+        // after the fork returns), so the guard re-entry marker must not
+        // leak into any of them: `dropGuarding()` is the same causal-
+        // boundary drop `Kernel.dispatch` uses, and for the same reason
+        // (see that method's own doc comment) — without it, a guarded
+        // handler forking (or `.spawn`ing) back to its own symbol would
+        // silently bypass its own gate. A no-op (`branchKernel === kernel`)
+        // when nothing is guarding, so this costs nothing for an app using
+        // no gates at all.
+        const branchKernel = kernel.dropGuarding();
         // Detached: fired, never awaited — a rejection is caught here and
         // reported to the kernel error sink, so it cannot reject the tracked
         // join nor become an unhandled rejection.
         for (const branch of untracked) {
-          void kernel
+          void branchKernel
             .runStages(branch.erasedStages, value, parentSpan)
-            .catch((error: unknown) => kernel.reportDetached(detachedSource, error));
+            .catch((error: unknown) => branchKernel.reportDetached(detachedSource, error));
         }
         const tracked = await Promise.all(
-          pipes.map((pipe) => kernel.runStages(pipe.erasedStages, value, parentSpan)),
+          pipes.map((pipe) => branchKernel.runStages(pipe.erasedStages, value, parentSpan)),
         );
         return next(forwardCursor ? value : tracked);
       },

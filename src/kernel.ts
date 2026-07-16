@@ -8,6 +8,7 @@ import { CommandBus } from './command-bus.js';
 import { Buffer, BufferBuilder, KernelErrorState } from './buffer.js';
 import { appendTraceEntry, describeTracePayload, TraceState, type TraceSink } from './trace.js';
 import { describePipe, type PipeDescriptorEntry } from './wiring-graph.js';
+import type { GateRef, GuardCatalogEntry } from './gate.js';
 
 // MARK: - KernelError
 
@@ -149,6 +150,57 @@ function isComposing(handler: (...args: never[]) => unknown): boolean {
   return handler.length >= 2;
 }
 
+// MARK: - Gate fold (guard)
+
+/**
+ * The single wrapper every guarded target's handler is replaced with —
+ * `KernelBuilder.build()`'s `#composeGates` is the only caller, and it calls
+ * this exactly once per guarded target (never nested). Multi-gate is a
+ * **fold**: `gateIds` (one array per target, in `guard()`'s own
+ * accumulation order) run in that order, and the first non-`next` verdict
+ * short-circuits the rest — a later gate in the list is simply never
+ * invoked, so it produces no trace entry either (an honest trace of what
+ * actually ran, not what was declared). Folding into one wrapper (rather
+ * than nesting N single-gate wrappers, one per `guard()` call) is load-
+ * bearing, not a style choice: nesting `gatedB(gatedA(original))` would make
+ * the outer wrapper's re-entry marker (`Kernel.withGuarding`) already read
+ * `true` inside the inner wrapper's own `isGuarding` check, silently
+ * skipping every gate but the first — see `#composeGates`'s own doc comment.
+ *
+ * Re-entrancy: `k.isGuarding(targetId)` is checked *before* the fold even
+ * starts — a call already inside this exact target's own gated flow (the
+ * gate itself calling back into its target, or the target's original
+ * handler recursing into itself) passes straight through to `original`,
+ * running the gate chain zero times on the re-entrant call — the
+ * infinite-loop seal. The marker is stacked exactly once, before the gate
+ * chain runs (`k.withGuarding(targetId)`), so every gate in the chain *and*
+ * `original` itself see the same marked kernel — a gate calling a
+ * *different* guarded target still finds that target's own marker absent,
+ * so that target's gate chain runs normally. See `Kernel.withGuarding`'s own
+ * doc comment for the marker's full lifetime, including the causal-boundary
+ * drop (`dispatch`/fork/`.spawn`) that keeps this re-entrancy exception from
+ * becoming an auth hole.
+ *
+ * Each gate runs through `kg.invoke(gateId, p)` — the ordinary chokepoint —
+ * so it mints its own child span and produces a normal trace entry (`gateId`
+ * as `symbolId`) for free; zero `TraceEntry` schema change. `original` runs
+ * with the kernel-with-marker `kg` (linking every downstream call the target
+ * itself makes to the same causal flow) and the call's **original** payload
+ * `p` — never a gate's `next(value)`, see `declareGate`'s own doc comment on
+ * why that value is ignored in v1.
+ */
+function gatedHandler(targetId: string, gateIds: readonly string[], original: ErasedHandler): ErasedHandler {
+  return async (k, p) => {
+    if (k.isGuarding(targetId)) return original(k, p);
+    const kg = k.withGuarding(targetId);
+    for (const gateId of gateIds) {
+      const v = await kg.invoke(gateId, p);
+      if (v.kind !== 'next') return v;
+    }
+    return original(kg, p);
+  };
+}
+
 /**
  * Collects the symbol → handler bindings during app wiring. Wiring code
  * registers into a builder; once everything is wired, `build()` freezes the
@@ -173,6 +225,17 @@ export class KernelBuilder {
    * themselves around after registration.
    */
   #flowDeclarations: { readonly flowKey: string; readonly typedDivertKeys: readonly string[] }[] = [];
+  /**
+   * `KernelSymbol.id` → the `GateRef`s guarding it, in registration order —
+   * what `guard()` writes and `build()`'s compose pass (`#composeGates`)
+   * folds into a single wrapper per target. Multiple `guard()` calls on the
+   * same target accumulate here; guarding the same `(target, gate)` pair
+   * twice is absorbed at write time (deduped by `GateRef.id`), not by
+   * relying on anything at `build()` time — there is no `#bind` involved in
+   * `guard()` at all, since nothing is registered into the handler table
+   * until `build()` runs.
+   */
+  #gates = new Map<string, GateRef<unknown>[]>();
 
   /**
    * The set of symbol ids currently bound. Read after wiring (before `build`)
@@ -309,6 +372,21 @@ export class KernelBuilder {
   }
 
   /**
+   * The catalog of every guarded target so far — one `GuardCatalogEntry` per
+   * distinct target `guard()` has been called on, `gateIds` in fold
+   * execution order. Exposed the same way `flowCatalog` is: a plain builder
+   * getter, safe to read before `build()` (same as `boundSymbolIds`/
+   * `boundFlowKeys`) — the MVP enumerability surface for "what guards what",
+   * without needing a running kernel or a trace.
+   */
+  get guardCatalog(): readonly GuardCatalogEntry[] {
+    return [...this.#gates.entries()].map(([targetId, gates]) => ({
+      targetId,
+      gateIds: gates.map((gate) => gate.id),
+    }));
+  }
+
+  /**
    * Bind a `DispatchKey` to the `Pipe` that answers it — the single call
    * that gives typed divert targets the same two-part treatment `register`
    * already gives symbols: a typed token (`DispatchKey<P>`, checked by
@@ -364,6 +442,40 @@ export class KernelBuilder {
   }
 
   /**
+   * Record intent to guard `target` with `gate` — a builder-owned gate
+   * table, riding the same "collect at wiring time, compose once at
+   * `build()`" rails as `flow`'s flow table. Multiple `guard()` calls on the
+   * same target accumulate, in call order — the order `build()`'s compose
+   * pass folds the gates in (see `#composeGates`/`gatedHandler`): the first
+   * non-`next` verdict short-circuits the rest, so call order is a real
+   * behavioral contract, not merely cosmetic. Guarding the same
+   * `(target, gate)` pair twice is idempotent — a duplicate `guard()` call
+   * is silently absorbed rather than running that gate twice per invoke.
+   *
+   * Order-independent with respect to `register`/`registerVerb`: `guard()`
+   * only records the association; nothing is composed, and no "is this
+   * bound yet" check happens, until `build()` — so `guard(target, gate)`
+   * before or after `register(target, ...)` behaves identically. `build()`
+   * throws `KernelError('unbound', ...)` if `target` is still unregistered
+   * at that point (see `#composeGates`) — silent absence of the guarded
+   * target is a defect, not a no-op.
+   *
+   * `P` is checked here against `target`'s own payload type, the same
+   * `KernelSymbol`-pinned discipline `register`/`flow` already use; the
+   * association is erased once folded into the handler table, exactly like
+   * every other symbol-table entry.
+   */
+  guard<P>(target: KernelSymbol<P, unknown>, gate: GateRef<P>): void {
+    const existing = this.#gates.get(target.id);
+    if (existing === undefined) {
+      this.#gates.set(target.id, [gate as GateRef<unknown>]);
+      return;
+    }
+    if (existing.some((g) => g.id === gate.id)) return; // idempotent: same (target, gate) pair already recorded
+    existing.push(gate as GateRef<unknown>);
+  }
+
+  /**
    * `build()`'s typed-divert completeness check: every typed key any
    * registered flow's pipe declared (`Pipe.declaredTypedDivertKeys`, which
    * already folds in fork-branch declarations — see that getter's own doc
@@ -405,6 +517,81 @@ export class KernelBuilder {
   }
 
   /**
+   * `build()`'s gate compose pass: fold `#gates` into `handlers` — a working
+   * copy of the builder's own handler table (`new Map(this.#handlers)`,
+   * built by the caller), never `this.#handlers` itself, so `build()` stays
+   * safe to call more than once — same "reads, never builder-state
+   * mutation" invariant `#assertTypedDivertKeysAreBound` and the rest of
+   * `build()` already hold.
+   *
+   * Two passes, in order:
+   * 1. **Register every distinct gate id once.** Gate ids are deduplicated
+   *    across every guarded target *before* any of them is registered — the
+   *    same `GateRef` guarding N targets must not attempt N registrations
+   *    of its id (that is exactly the false-positive `#bind`'s `'duplicate'`
+   *    throw would produce if this pass instead relied on it for
+   *    idempotency, one `#bind` call per `(target, gate)` pair). A gate id
+   *    that genuinely collides with an already-bound symbol id — a real
+   *    wiring mistake, not the "same gate on many targets" case just
+   *    filtered out — still throws `KernelError('duplicate', ...)`, the
+   *    same failure `#bind` itself would produce for a duplicate `register`;
+   *    this pass performs the check by hand against the working copy
+   *    instead of calling `#bind`, since `#bind` writes through to
+   *    `this.#handlers`. Each gate is bound as a **verb-returning** handler
+   *    (`async (k, p) => gate.gate(k, p)`, normalized to
+   *    `Promise<Verb<unknown>>` by `async`) — a gate answers a verdict, not
+   *    a bare value, so it is never wrapped in `next(...)` the way
+   *    `register`'s value-returning overload wraps a plain handler.
+   * 2. **Replace each guarded target's handler with a single folded
+   *    wrapper.** `original` is read from `handlers` (the working copy).
+   *    A target with no handler at all throws `KernelError('unbound', ...)`
+   *    — silent absence of the guarded target is a defect (a `guard()` call
+   *    on a forgotten `register`), caught here at `build()` rather than
+   *    surfacing only the first time the target is invoked. The replacement
+   *    is a single `handlers.set(targetId, gated)` — never a second
+   *    `register`, and never a second wrap of an already-wrapped handler:
+   *    `#gates` holds at most one `GateRef[]` per target, so there is only
+   *    ever one wrap per target by construction — see `gatedHandler`'s own
+   *    doc comment for why nesting two single-gate wrappers instead would
+   *    silently break every gate but the first.
+   */
+  #composeGates(handlers: Map<string, ErasedHandler>): void {
+    if (this.#gates.size === 0) return;
+
+    const distinctGates = new Map<string, GateRef<unknown>>();
+    for (const gateRefs of this.#gates.values()) {
+      for (const gateRef of gateRefs) {
+        distinctGates.set(gateRef.id, gateRef);
+      }
+    }
+    for (const [gateId, gateRef] of distinctGates) {
+      if (handlers.has(gateId)) {
+        throw new KernelError('duplicate', gateId, `Gate id '${gateId}' is already bound — duplicate register`);
+      }
+      handlers.set(gateId, async (kernel, payload) => gateRef.gate(kernel, payload));
+    }
+
+    for (const [targetId, gateRefs] of this.#gates) {
+      const original = handlers.get(targetId);
+      if (original === undefined) {
+        throw new KernelError(
+          'unbound',
+          targetId,
+          `guard: '${targetId}' was never bound via KernelBuilder.register/registerVerb — forgotten register?`,
+        );
+      }
+      handlers.set(
+        targetId,
+        gatedHandler(
+          targetId,
+          gateRefs.map((gateRef) => gateRef.id),
+          original,
+        ),
+      );
+    }
+  }
+
+  /**
    * Freeze the bindings into an immutable `Kernel`. The builder itself stays
    * usable, but the kernel takes a snapshot — later registers do not leak
    * into an already-built kernel.
@@ -417,10 +604,15 @@ export class KernelBuilder {
    * known at this call, not to `BufferBuilder` itself.
    *
    * Also runs `#assertTypedDivertKeysAreBound` — see that method's own doc
-   * comment for exactly what it does and does not catch.
+   * comment for exactly what it does and does not catch — and
+   * `#composeGates`, which folds every `guard()`-recorded gate into the
+   * working handler table before it is frozen into the returned `Kernel`
+   * (see that method's own doc comment).
    */
   build(options: KernelBuildOptions = {}): Kernel {
     this.#assertTypedDivertKeysAreBound();
+    const handlers = new Map(this.#handlers);
+    this.#composeGates(handlers);
     const bufferBuilder = options.buffer ?? new BufferBuilder();
     const tracing = options.tracing ?? false;
     if (tracing) {
@@ -429,7 +621,7 @@ export class KernelBuilder {
     const buffer = bufferBuilder.build();
     const onError = options.onError ?? KernelBuilder.#defaultErrorSink(buffer);
     const onTrace = tracing ? (options.onTrace ?? KernelBuilder.#defaultTraceSink(buffer, options.traceCap ?? 300)) : undefined;
-    return new Kernel(new Map(this.#handlers), onError, buffer, new Map(this.#flows), onTrace);
+    return new Kernel(handlers, onError, buffer, new Map(this.#flows), onTrace);
   }
 
   /**
@@ -522,6 +714,21 @@ export class Kernel {
    * [[span.ts]].
    */
   readonly #ambientSpan: Span | undefined;
+  /**
+   * The `guard` re-entry marker for the causal flow currently running
+   * through this kernel value — the set of guarded target symbol ids whose
+   * gate chain has already run *somewhere upstream in this same flow*.
+   * Trace-independent by design: a plain `Set<string>`, threaded exactly
+   * like `#ambientSpan` (see `#scoped`), never derived from `#onTrace`/trace
+   * state — so a gate's own re-entrancy protection (`isGuarding`/
+   * `withGuarding`, read by kernel.ts's `gatedHandler`) works identically
+   * whether tracing is on or off. Empty on every kernel `build()` returns
+   * and at every causal-flow boundary (`dispatch`'s enqueue, a fork branch,
+   * `.spawn` — see `dropGuarding`): the marker is scoped to *one* causal
+   * flow, deliberately, so a guarded handler that dispatches/forks/spawns
+   * back to its own symbol does not silently bypass its own gate.
+   */
+  readonly #guarding: ReadonlySet<string>;
 
   /** @internal Construct via `KernelBuilder.build()`, never directly. */
   constructor(
@@ -532,6 +739,7 @@ export class Kernel {
     onTrace?: TraceSink,
     ambientSpan?: Span,
     commands?: CommandBus,
+    guarding?: ReadonlySet<string>,
   ) {
     this.#handlers = handlers;
     this.#errorSink = errorSink;
@@ -540,19 +748,107 @@ export class Kernel {
     this.#onTrace = onTrace;
     this.#ambientSpan = ambientSpan;
     this.#commands = commands ?? new CommandBus();
+    this.#guarding = guarding ?? new Set();
   }
 
   /**
    * A view of this kernel whose public entry points (`call`/`dispatch`/
    * `compose`/`run`) parent their spans under `span` instead of minting flow
    * roots. Shares every piece of live state — handler table, command bus,
-   * buffer, error/trace sinks, flow table — so it *is* this kernel for every
-   * purpose except span parentage. `invoke` hands one to each handler it
-   * runs, which is what links a handler's own call-backs to the handler's
-   * span (span linking; see [[span.ts]]).
+   * buffer, error/trace sinks, flow table, **and the guard re-entry
+   * marker** — so it *is* this kernel for every purpose except span
+   * parentage. `invoke` hands one to each handler it runs, which is what
+   * links a handler's own call-backs to the handler's span (span linking;
+   * see [[span.ts]]). Threading `#guarding` through here (not just
+   * `#ambientSpan`) is what keeps a gate's re-entrancy check trace-
+   * independent: `invoke` only calls `#scoped` when tracing is on
+   * (`this.#onTrace === undefined ? this : this.#scoped(span)`), and with
+   * tracing off the *same* `this` — marker included — is used untouched, so
+   * either path preserves the marker identically.
    */
   #scoped(span: Span): Kernel {
-    return new Kernel(this.#handlers, this.#errorSink, this.buffer, this.#flows, this.#onTrace, span, this.#commands);
+    return new Kernel(
+      this.#handlers,
+      this.#errorSink,
+      this.buffer,
+      this.#flows,
+      this.#onTrace,
+      span,
+      this.#commands,
+      this.#guarding,
+    );
+  }
+
+  /**
+   * @internal Not part of the app-facing surface — only kernel.ts's
+   * `gatedHandler` (the sole handler `KernelBuilder.build()`'s
+   * `#composeGates` replaces a guarded target's own handler with) reads
+   * this. Whether `targetId`'s gate chain has already run upstream in this
+   * same causal flow — see `#guarding`'s own doc comment for the marker's
+   * full scope and lifetime.
+   */
+  isGuarding(targetId: string): boolean {
+    return this.#guarding.has(targetId);
+  }
+
+  /**
+   * @internal A view of this kernel with `targetId` added to the guard
+   * re-entry marker — `gatedHandler`'s own call, made exactly once, before
+   * its gate chain runs, so every gate in the chain and the target's
+   * original handler all see the same marked kernel (see `gatedHandler`'s
+   * own doc comment). Shares every other piece of live state with `this`,
+   * same as `#scoped` — this is a marker-only view, not itself a
+   * span-scoped one: a gate's own `invoke` call still mints its span the
+   * ordinary way, through `invoke`'s existing `#scoped`, which now also
+   * carries this marker forward.
+   */
+  withGuarding(targetId: string): Kernel {
+    const guarding = new Set(this.#guarding);
+    guarding.add(targetId);
+    return new Kernel(
+      this.#handlers,
+      this.#errorSink,
+      this.buffer,
+      this.#flows,
+      this.#onTrace,
+      this.#ambientSpan,
+      this.#commands,
+      guarding,
+    );
+  }
+
+  /**
+   * @internal A view of this kernel with the guard re-entry marker cleared
+   * — the causal-boundary drop point: `dispatch`'s enqueue closure and
+   * `PipeBuilder`'s fork stage (tracked and untracked branches alike,
+   * including `.spawn`) call this before running their own new causal flow,
+   * so the marker never leaks across one of these boundaries. Without the
+   * drop, a guarded handler that dispatches, forks, or spawns back to its
+   * own symbol would find `isGuarding(targetId)` already `true` on the far
+   * side of the boundary and silently skip its own gate — an auth hole.
+   * `#guarding.size === 0` short-circuits to `this` (no new instance), so
+   * the common case — an app using no gates at all, or a boundary crossed
+   * outside any guarded flow — pays no extra allocation, matching
+   * `dispatch`'s existing "behaviour is byte-identical when nothing is
+   * observing" cost discipline.
+   *
+   * Not `#`-private: `PipeBuilder`'s fork stage needs to call it on the
+   * kernel its own stage closure receives — the same reason `invoke`/
+   * `runStages`/`reportDetached` are not `#`-private either.
+   */
+  dropGuarding(): Kernel {
+    return this.#guarding.size === 0
+      ? this
+      : new Kernel(
+          this.#handlers,
+          this.#errorSink,
+          this.buffer,
+          this.#flows,
+          this.#onTrace,
+          this.#ambientSpan,
+          this.#commands,
+          new Set(),
+        );
   }
 
   /**
@@ -600,7 +896,15 @@ export class Kernel {
    * `PipeBuilder` stages must funnel through it.
    *
    * `parentSpan`: the enclosing span, threaded in explicitly by
-   * whichever internal caller has one (`runStages`, fork). Public entry
+   * whichever internal caller has one (`runStages`, fork), and **falling
+   * back to this instance's own `#ambientSpan` when omitted** — the same
+   * value `call` already passes explicitly (`this.invoke(sym.id, payload,
+   * this.#ambientSpan)`), so the fallback is a no-op for every existing
+   * caller, all of which already pass one. The fallback exists for
+   * kernel.ts's own `gatedHandler` (the `guard` fold wrapper): a gate runs
+   * via `kg.invoke(gateId, p)` with no third argument, and still needs to
+   * nest under the guarded target's own span (`kg`'s ambient span, inherited
+   * from `Kernel.withGuarding`) rather than mint a false root. Public entry
    * points (`call`/`dispatch`/`compose`/`run`) pass their own instance's
    * ambient span — `undefined` on the kernel `build()` returned (a top-level
    * call is a flow root), the handler's span on the span-scoped view a
@@ -626,7 +930,7 @@ export class Kernel {
     if (handler === undefined) {
       throw new KernelError('unbound', id, `No handler bound for symbol '${id}' — forgotten register?`);
     }
-    const span = mintSpan(parentSpan);
+    const span = mintSpan(parentSpan ?? this.#ambientSpan);
     // The handler runs against a span-scoped view of this kernel, so its own
     // call-backs parent under the span just minted — Swift's
     // `Kernel.$span.withValue(span) { body() }`, carried on the kernel value
@@ -717,7 +1021,13 @@ export class Kernel {
     // off, spans are unobservable and scoping is skipped, so behaviour is
     // byte-identical to before this change (the returned span is then an
     // inert handle that correlates to nothing, because nothing is recorded).
-    const scoped = this.#onTrace === undefined ? this : this.#scoped(span);
+    // `dropGuarding()` is the causal-boundary drop (see that method's own
+    // doc comment): a dispatched command starts a NEW causal flow, so a
+    // guard re-entry marker carried by `this` must not leak into it — a
+    // guarded handler dispatching back to its own symbol must still hit its
+    // own gate on the far side. A no-op when nothing is guarding, so this
+    // costs nothing for an app using no gates at all.
+    const scoped = (this.#onTrace === undefined ? this : this.#scoped(span)).dropGuarding();
     this.#commands.enqueue(async () => {
       try {
         await scoped.call(sym, p);

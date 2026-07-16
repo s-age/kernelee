@@ -20,6 +20,14 @@ export {
   type KernelErrorCode,
 } from './kernel.js';
 export {
+  GateError,
+  declareGate,
+  type Gate,
+  type GateErrorCode,
+  type GateRef,
+  type GuardCatalogEntry,
+} from './gate.js';
+export {
   Pipe,
   PipeBuilder,
   pipeline,
@@ -81,5 +89,6 @@ export {
   type WiringEndpointKind,
   type WiringGraphDocument,
   type WiringGraphIssue,
+  type WiringGuardEntry,
   type WiringSymbolEntry,
 } from './wiring-graph.js';

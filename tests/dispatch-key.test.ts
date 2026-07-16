@@ -235,7 +235,7 @@ test('flowCatalogFeedsProjectWiringGraphWithResolvedDivertedFromAndDivertTargetK
   builder.flow(bKey, 'bPipe', bPipe);
   builder.build();
 
-  const doc = projectWiringGraph(builder.flowCatalog, builder.boundSymbolIds);
+  const doc = projectWiringGraph(builder.flowCatalog, builder.boundSymbolIds, builder.guardCatalog);
   const aEntry = doc.endpoints.find((e) => e.key === 'flow.catalog.a')!;
   const bEntry = doc.endpoints.find((e) => e.key === 'flow.catalog.b')!;
 

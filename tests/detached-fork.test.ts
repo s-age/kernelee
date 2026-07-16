@@ -219,6 +219,7 @@ test('projectWiringGraphFoldsSymbolAndDivertsToDeclaredInsideAnUntrackedBranch',
   const doc = projectWiringGraph(
     [describePipe('wiring.entryCmd', 'forkPipe', forkPipe), describePipe('wiring.detachedTarget', 'targetPipe', targetPipe)],
     builder.boundSymbolIds,
+    builder.guardCatalog,
   );
 
   // The detached branch's symbol was folded — attributed to the fork endpoint.
@@ -231,11 +232,15 @@ test('projectWiringGraphFoldsSymbolAndDivertsToDeclaredInsideAnUntrackedBranch',
   expect(targetNode.divertedFrom).toEqual(['wiring.entryCmd']);
 });
 
-// MARK: - schemaVersion bumped 4 → 5
+// MARK: - schemaVersion bumped 4 → 5 → 6
 
-test('projectWiringGraphStampsSchemaVersion5', () => {
+test('projectWiringGraphStampsSchemaVersion6', () => {
   const builder = new KernelBuilder();
   builder.register(double, (n) => n * 2);
-  const doc = projectWiringGraph([describePipe('detached.double', 'p', pipeline(double).seal())], builder.boundSymbolIds);
-  expect(doc.schemaVersion).toBe(5);
+  const doc = projectWiringGraph(
+    [describePipe('detached.double', 'p', pipeline(double).seal())],
+    builder.boundSymbolIds,
+    builder.guardCatalog,
+  );
+  expect(doc.schemaVersion).toBe(6);
 });

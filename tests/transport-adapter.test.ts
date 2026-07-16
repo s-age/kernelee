@@ -47,13 +47,13 @@ test('static path: describePipe + projectWiringGraph produce a catalog forwardab
   const builder = new KernelBuilder();
   builder.register(echo, (n: number) => n);
 
-  const doc = projectWiringGraph(catalog, builder.boundSymbolIds);
+  const doc = projectWiringGraph(catalog, builder.boundSymbolIds, builder.guardCatalog);
   send(doc);
 
   expect(sent).toHaveLength(1);
   expect(sent[0]).toMatchObject({
-    // Bumped 4 → 5 with StageDescriptor.untrackedBranches (detached fork branches).
-    schemaVersion: 5,
+    // Bumped 5 → 6 with the required WiringGraphDocument.guards field (gate wiring).
+    schemaVersion: 6,
     endpoints: [{ key: echo.id, kind: 'endpoint' }],
   });
 });

@@ -1,5 +1,7 @@
 import { expect, test } from 'vitest';
 import {
+  abort,
+  declareGate,
   describePipe,
   next,
   pipeline,
@@ -46,7 +48,7 @@ test('projectWiringGraphFoldsDivertsToIntoDivertedFromAndClassifiesEndpointsByBo
   builder.register(double, (n) => n * 2);
   // `boundSymbolIds` is read from the builder — no kernel/build() needed for a static projection.
 
-  const doc = projectWiringGraph([entryEntry, targetEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryEntry, targetEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   const entryNode = doc.endpoints.find((e) => e.key === 'wiring.entryCmd')!;
   const targetNode = doc.endpoints.find((e) => e.key === 'wiring.target')!;
@@ -77,7 +79,7 @@ test('projectWiringGraphWalksForkBranchesForSymbolUsageAndDivertsTo', () => {
   builder.register(stringify, (n) => `${n}`);
   const boundSymbolIds = builder.boundSymbolIds;
 
-  const doc = projectWiringGraph([forkEntry, targetEntry], boundSymbolIds);
+  const doc = projectWiringGraph([forkEntry, targetEntry], boundSymbolIds, builder.guardCatalog);
 
   const doubleSymbol = doc.symbols.find((s) => s.symbolId === 'wiring.double')!;
   expect(doubleSymbol.bound).toBe(true);
@@ -98,7 +100,7 @@ test('projectWiringGraphCollectsDivertsToStringsThatMatchNoCatalogKey', () => {
 
   const builder = new KernelBuilder();
   builder.register(entryCmd, (n) => n);
-  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(doc.unresolvedDivertTargets).toEqual(['wiring.ghost']); // deduplicated, not silently dropped
 });
@@ -115,7 +117,7 @@ test('projectWiringGraphCollectsBoundSymbolIdsThatMatchNoCatalogKeyOrReferencedS
   // 'wiring.stringify' is bound but appears in no catalog entry's key and no
   // stage's symbolId — a plain Mutator-shaped bound symbol, never diverted to.
   builder.register(stringify, (n) => `${n}`);
-  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(doc.unlistedBoundSymbols).toEqual(['wiring.stringify']);
 });
@@ -127,7 +129,7 @@ test('projectWiringGraphUnlistedBoundSymbolsIsEmptyWhenEveryBoundIdIsAKeyOrRefer
   const builder = new KernelBuilder();
   builder.register(entryCmd, (n) => n);
   builder.register(double, (n) => n * 2);
-  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(doc.unlistedBoundSymbols).toEqual([]);
 });
@@ -139,7 +141,7 @@ test('validateWiringGraphReportsOneUnlistedBoundSymbolIssuePerEntryUnconditional
   const builder = new KernelBuilder();
   builder.register(entryCmd, (n) => n);
   builder.register(double, (n) => n * 2); // bound, but no Pipe/stage ever names it
-  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(validateWiringGraph(doc)).toEqual([{ kind: 'unlistedBoundSymbol', key: 'wiring.double' }]);
 });
@@ -154,7 +156,7 @@ test('projectWiringGraphDocumentSurvivesJSONRoundTrip', () => {
   builder.register(entryCmd, (n) => n);
   builder.register(double, (n) => n * 2);
   builder.register(stringify, (n) => `${n}`);
-  const doc = projectWiringGraph([forkEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([forkEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   const json = JSON.stringify(doc); // must not throw — every field is plain data
   expect(JSON.parse(json)).toEqual(doc);
@@ -175,7 +177,7 @@ test('validateWiringGraphReturnsEmptyArrayForACleanDocument', () => {
   const builder = new KernelBuilder();
   builder.register(entryCmd, (n) => n);
   builder.register(double, (n) => n * 2);
-  const doc = projectWiringGraph([entryEntry, targetEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryEntry, targetEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(validateWiringGraph(doc)).toEqual([]);
 });
@@ -202,7 +204,7 @@ test('validateWiringGraphReportsUnresolvedDivertTargetsWithReferrers', () => {
   // to the unresolvedDivertTarget check only.
   builder.register(entryASymbol, (n) => n);
   builder.register(entryBSymbol, (n) => n);
-  const doc = projectWiringGraph([entryAEntry, entryBEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryAEntry, entryBEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(validateWiringGraph(doc)).toEqual([
     { kind: 'unresolvedDivertTarget', key: 'wiring.ghost', referrers: ['wiring.entryA', 'wiring.entryB'] },
@@ -216,7 +218,7 @@ test('validateWiringGraphReportsOrphanEntryForADivertTargetWithNoExternalReferre
   const builder = new KernelBuilder();
   builder.register(double, (n) => n * 2);
   // 'wiring.orphan' is neither bound nor named by any entry's divertsTo — nothing justifies it.
-  const doc = projectWiringGraph([orphanEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([orphanEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(validateWiringGraph(doc)).toEqual([{ kind: 'orphanEntry', key: 'wiring.orphan' }]);
 });
@@ -233,7 +235,7 @@ test('validateWiringGraphExcludesSelfDivertsToWhenCheckingOrphanStatus', () => {
   const loopEntry = describePipe('wiring.loop', 'loopPipe', loopPipe);
 
   const builder = new KernelBuilder();
-  const doc = projectWiringGraph([loopEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([loopEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(doc.endpoints[0]!.divertedFrom).toEqual(['wiring.loop']); // projectWiringGraph itself keeps the self-edge
   expect(validateWiringGraph(doc)).toEqual([{ kind: 'orphanEntry', key: 'wiring.loop' }]); // but validation excludes it
@@ -246,7 +248,94 @@ test('validateWiringGraphNeverFlagsBoundEndpointsAsOrphansRegardlessOfDivertedFr
   const builder = new KernelBuilder();
   builder.register(entryCmd, (n) => n);
   // Bound, and named by no one's divertsTo — still not an orphan, since dispatch itself justifies it.
-  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
+
+  expect(validateWiringGraph(doc)).toEqual([]);
+});
+
+// MARK: - guards (schemaVersion 6)
+
+test('projectWiringGraphStampsSchemaVersion6', () => {
+  const builder = new KernelBuilder();
+  builder.register(entryCmd, (n) => n);
+  const doc = projectWiringGraph([], builder.boundSymbolIds, builder.guardCatalog);
+  expect(doc.schemaVersion).toBe(6);
+});
+
+test('projectWiringGraphProjectsGuardCatalogVerbatimIntoDocGuards', () => {
+  const entryPipe = pipeline(entryCmd).seal();
+  const entryEntry = describePipe('wiring.entryCmd', 'entryPipe', entryPipe);
+  const gate = declareGate<number>('guard:wiring.entryCmd', () => next());
+
+  const builder = new KernelBuilder();
+  builder.register(entryCmd, (n) => n);
+  builder.guard(entryCmd, gate);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
+
+  expect(doc.guards).toEqual([{ targetId: 'wiring.entryCmd', gateIds: ['guard:wiring.entryCmd'] }]);
+});
+
+test('projectWiringGraphPreservesFoldExecutionOrderOfMultipleGatesOnOneTarget', () => {
+  const entryPipe = pipeline(entryCmd).seal();
+  const entryEntry = describePipe('wiring.entryCmd', 'entryPipe', entryPipe);
+  // Two gates on the same target: order must match `guard()` call order —
+  // this is a behavioral contract (first non-`next` short-circuits), never re-sorted.
+  const gateA = declareGate<number>('guard:wiring.entryCmd.a', () => next());
+  const gateB = declareGate<number>('guard:wiring.entryCmd.b', () => abort(undefined));
+
+  const builder = new KernelBuilder();
+  builder.register(entryCmd, (n) => n);
+  builder.guard(entryCmd, gateA);
+  builder.guard(entryCmd, gateB);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
+
+  expect(doc.guards).toEqual([
+    { targetId: 'wiring.entryCmd', gateIds: ['guard:wiring.entryCmd.a', 'guard:wiring.entryCmd.b'] },
+  ]);
+});
+
+test('validateWiringGraphReportsUnanchoredGuardTargetForATargetInNeitherEndpointsNorSymbols', () => {
+  // Guarded and bound, but never catalogued as a Pipe key and never invoked from any
+  // other stage's symbolId — the same shape `unlistedBoundSymbol` reports, now for a
+  // guard target: legitimate, not judged, just surfaced.
+  const gate = declareGate<number>('guard:wiring.entryCmd.unanchored', () => next());
+
+  const builder = new KernelBuilder();
+  builder.register(entryCmd, (n) => n);
+  builder.guard(entryCmd, gate);
+  // entryCmd itself is never described as a Pipe entry, so it names no endpoint/symbol.
+  const doc = projectWiringGraph([], builder.boundSymbolIds, builder.guardCatalog);
+
+  expect(validateWiringGraph(doc)).toEqual(
+    expect.arrayContaining([{ kind: 'unanchoredGuardTarget', key: 'wiring.entryCmd' }]),
+  );
+});
+
+test('validateWiringGraphDoesNotReportUnanchoredGuardTargetWhenTheTargetIsACatalogEndpoint', () => {
+  const entryPipe = pipeline(entryCmd).seal();
+  const entryEntry = describePipe('wiring.entryCmd', 'entryPipe', entryPipe);
+  const gate = declareGate<number>('guard:wiring.entryCmd.anchored', () => next());
+
+  const builder = new KernelBuilder();
+  builder.register(entryCmd, (n) => n);
+  builder.guard(entryCmd, gate);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
+
+  expect(validateWiringGraph(doc)).toEqual([]);
+});
+
+test('validateWiringGraphDoesNotReportUnanchoredGuardTargetWhenTheTargetIsAReferencedSymbol', () => {
+  // 'wiring.double' is never a catalog key, but it IS a stage's symbolId inside entryPipe —
+  // that alone counts as "known" for unanchoredGuardTarget, same as it does for unlistedBoundSymbol.
+  const entryPipe = pipeline(entryCmd).pipe(double).seal();
+  const entryEntry = describePipe('wiring.entryCmd', 'entryPipe', entryPipe);
+  const gate = declareGate<number>('guard:wiring.double', () => next());
+
+  const builder = new KernelBuilder();
+  builder.register(entryCmd, (n) => n);
+  builder.register(double, (n) => n * 2);
+  builder.guard(double, gate);
+  const doc = projectWiringGraph([entryEntry], builder.boundSymbolIds, builder.guardCatalog);
 
   expect(validateWiringGraph(doc)).toEqual([]);
 });

@@ -1,3 +1,4 @@
+import type { GuardCatalogEntry } from './gate.js';
 import type { Pipe, StageDescriptor } from './pipe.js';
 
 // MARK: - PipeDescriptorEntry (one Pipe, catalogued)
@@ -62,6 +63,18 @@ export interface WiringSymbolEntry {
   readonly usedByEndpoints: readonly string[];
 }
 
+/**
+ * The static twin of `gate.ts`'s `GuardCatalogEntry` inside a projected
+ * `WiringGraphDocument` — a plain alias, not a new type, because the shape a
+ * consumer needs here (`targetId` + `gateIds` in fold execution order) is
+ * exactly `KernelBuilder.guardCatalog`'s own shape with nothing added or
+ * dropped; introducing a second, structurally-identical interface would only
+ * invite the two to drift silently apart at the one point (this document)
+ * where the golden-JSON contract most needs them not to. `projectWiringGraph`
+ * takes `guardCatalog: readonly WiringGuardEntry[]` verbatim.
+ */
+export type WiringGuardEntry = GuardCatalogEntry;
+
 /** The projected, JSON-serializable static wiring graph — Swift's `IndexDocument`, scoped to wiring topology. */
 export interface WiringGraphDocument {
   /**
@@ -70,10 +83,31 @@ export interface WiringGraphDocument {
    * field, but the JSON shape a downstream consumer (devtools panel,
    * py-kernelee, the mcp-tools scanner) reads changed, so the version moves in
    * lockstep. Consumers should gate on `schemaVersion >= 5` to read the field.
+   *
+   * Bumped 5 → 6 when the document gained the required `guards` field (gate
+   * wiring — see `gate.ts`'s `declareGate`/`KernelBuilder.guard`/
+   * `GuardCatalogEntry`). Additive in shape, like 4 → 5, but `guards` is
+   * *required* rather than optional-with-a-`[]`-default specifically so "this
+   * app wires zero gates" (`guards: []`) stays distinguishable from "the
+   * projector forgot to pass a guard catalog" (a field silently missing from
+   * the JSON) — the same silent-absence failure `unresolvedDivertTargets`/
+   * `unlistedBoundSymbols` already exist to reject, now applied to gates.
+   * Consumers should gate on `schemaVersion >= 6` to expect `guards` to be
+   * present.
    */
-  readonly schemaVersion: 5;
+  readonly schemaVersion: 6;
   readonly endpoints: readonly WiringEndpoint[];
   readonly symbols: readonly WiringSymbolEntry[];
+  /**
+   * Every guarded target from `KernelBuilder.guardCatalog`, taken verbatim —
+   * `gateIds` stays in fold execution order (never re-sorted; see
+   * `GuardCatalogEntry`'s own doc comment on why that order is a behavioral
+   * contract). `targetId` is a `KernelSymbol` id, which may or may not also
+   * appear in `endpoints`/`symbols` below — see {@link
+   * WiringGraphIssue}'s `unanchoredGuardTarget` for what an absence there
+   * means (report, don't judge).
+   */
+  readonly guards: readonly WiringGuardEntry[];
   /**
    * `divertsTo` strings that match no catalog entry's `key`. Never dropped
    * silently — a stale or externally-owned divert target still shows up here
@@ -144,10 +178,21 @@ function addToSetMap<K>(map: Map<K, Set<string>>, key: K, value: string): void {
  * `unresolvedDivertTargets` — so a non-empty `unresolvedDivertTargets` means
  * either a stale/typo'd `divertsTo` entry or a deliberately uncatalogued
  * external target, not necessarily a bug.
+ *
+ * @param guardCatalog `KernelBuilder.guardCatalog`, taken verbatim into
+ * `doc.guards` (fold execution order preserved, never re-sorted — see
+ * `GuardCatalogEntry`'s own doc comment on why that order is a behavioral
+ * contract, not cosmetic). Required, not optional-with-a-`[]`-default: an
+ * optional parameter would make "this app wires zero gates" indistinguishable
+ * from "the caller forgot to pass guardCatalog" once read back from the v6
+ * document — exactly the silent-absence failure this feature exists to kill.
+ * A caller with genuinely no gates passes `[]` explicitly; the compile-time
+ * noise this adds at every existing call site is the point, not an accident.
  */
 export function projectWiringGraph(
   catalog: readonly PipeDescriptorEntry[],
   boundSymbolIds: ReadonlySet<string>,
+  guardCatalog: readonly WiringGuardEntry[],
 ): WiringGraphDocument {
   const keys = new Set(catalog.map((entry) => entry.key));
   const flatByEntry = catalog.map((entry) => flattenStages(entry.stages));
@@ -201,9 +246,10 @@ export function projectWiringGraph(
   );
 
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     endpoints,
     symbols,
+    guards: guardCatalog,
     unresolvedDivertTargets: unresolved,
     unlistedBoundSymbols,
   };
@@ -218,17 +264,24 @@ export function projectWiringGraph(
  * no referrer other than itself; `unlistedBoundSymbol` —
  * a straight echo of `doc.unlistedBoundSymbols` — one issue per entry, always,
  * never filtered here (see that field's own doc comment on why judging actionability needs
- * information this module does not have).
+ * information this module does not have); `unanchoredGuardTarget` — a
+ * `doc.guards[].targetId` that matches neither an `endpoints[].key` nor a
+ * `symbols[].symbolId` — "known" here means exactly that: nothing in the
+ * projected document names the target at all, guarded or not. `guard()`
+ * targets are plain `KernelSymbol`s, and a symbol may legitimately be bound
+ * and guarded without ever appearing in a catalogued `Pipe` (the same reason
+ * `unlistedBoundSymbol` exists) — so this is reported, not judged, same
+ * discipline as the other two checks below.
  */
 export interface WiringGraphIssue {
-  readonly kind: 'unresolvedDivertTarget' | 'orphanEntry' | 'unlistedBoundSymbol';
+  readonly kind: 'unresolvedDivertTarget' | 'orphanEntry' | 'unlistedBoundSymbol' | 'unanchoredGuardTarget';
   readonly key: string;
   /** `unresolvedDivertTarget` only: catalog entry keys whose stage tree names this key in `divertsTo`. */
   readonly referrers?: readonly string[];
 }
 
 /**
- * Validate an already-projected `WiringGraphDocument` (three checks — see {@link
+ * Validate an already-projected `WiringGraphDocument` (four checks — see {@link
  * WiringGraphIssue}). Never throws: an empty array means clean, same "surface data, let the
  * caller assert" idiom `unresolvedDivertTargets` itself already uses — a consumer writes its own
  * `expect(validateWiringGraph(doc)).toEqual([])`.
@@ -265,6 +318,13 @@ export interface WiringGraphIssue {
  * catalog citizen is a consumer/scanner concern; whether an
  * unclassified entry is actionable at all is a further-downstream consumer call — same
  * "report, don't judge" discipline as `orphanEntry`.
+ *
+ * **`unanchoredGuardTarget` needs one new lookup**: whether each `doc.guards[].targetId` matches
+ * an `endpoints[].key` or a `symbols[].symbolId` — both already computed by {@link
+ * projectWiringGraph}, so this is a membership check over existing document arrays, not a
+ * re-walk of `stages`. Same "report, don't judge" discipline as `unlistedBoundSymbol`: a guarded
+ * target absent from both is not assumed to be a mistake (see {@link WiringGraphIssue}'s own doc
+ * comment on why a guarded, bound, uncatalogued `KernelSymbol` is a legitimate shape).
  */
 export function validateWiringGraph(doc: WiringGraphDocument): readonly WiringGraphIssue[] {
   const issues: WiringGraphIssue[] = [];
@@ -294,6 +354,14 @@ export function validateWiringGraph(doc: WiringGraphDocument): readonly WiringGr
     const externalReferrers = endpoint.divertedFrom.filter((key) => key !== endpoint.key);
     if (externalReferrers.length === 0) {
       issues.push({ kind: 'orphanEntry', key: endpoint.key });
+    }
+  }
+
+  const endpointKeys = new Set(doc.endpoints.map((endpoint) => endpoint.key));
+  const symbolIds = new Set(doc.symbols.map((symbol) => symbol.symbolId));
+  for (const guard of doc.guards) {
+    if (!endpointKeys.has(guard.targetId) && !symbolIds.has(guard.targetId)) {
+      issues.push({ kind: 'unanchoredGuardTarget', key: guard.targetId });
     }
   }
 
