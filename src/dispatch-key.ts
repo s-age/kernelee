@@ -26,16 +26,6 @@
  * `PipeDescriptorEntry.key` already use — nothing else about the shape
  * differs from `KernelSymbol`.
  *
- * Swift-side: `swift-kernelee`'s `Pipe.swift` carries the identical,
- * deliberate limitation today (`divertsTo` is author-typed free text there
- * too — see that file's own doc comment, and this port's
- * `docs/wiring-graph.md`, "documented ceiling" section). This feature is
- * TS-led: nothing in Swift forces a matching change, but a `DispatchKey`-
- * shaped phantom generic struct (`struct DispatchKey<Payload> { let key:
- * String; let description: String? }`, mirroring Swift's own `Symbol<P, O>`)
- * would be the natural counterpart there, should the same problem get closed
- * on that side too.
- *
  * Deliberately dependency-free (no imports) — `verb.ts` (for `keyedDiversion`)
  * and `pipe.ts` (for the typed divert channel) both need this module, and a
  * leaf module with nothing to import from either of them cannot itself

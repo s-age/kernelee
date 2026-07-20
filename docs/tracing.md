@@ -1,12 +1,10 @@
 # Span propagation
 
 `Kernel.invoke` (kernel.ts) is the single chokepoint, and tracing hooks into
-it. The Swift implementation wraps the same chokepoint with `traced(_:_:_:)`
-(Kernel+Trace.swift) and tracks "which call tree am I in" implicitly via
-`@TaskLocal static var span: UUID?`. JS has no TaskLocal equivalent
-(runtime-independent ambient execution context) — `AsyncLocalStorage` is
-Node-only, and in the browser the tracking would silently drop, which is why
-that approach is a non-starter.
+it. Implicit ambient tracking of "which call tree am I in" (via a task-local)
+is not viable in JS: there is no runtime-independent ambient execution
+context — `AsyncLocalStorage` is Node-only, and in the browser the tracking
+would silently drop, which is why that approach is a non-starter.
 
 **Adopted: parent/child linking via explicit arguments, confined to
 framework-internal calls.** `Span { id, parentId? }` (`src/span.ts`) is
@@ -28,48 +26,42 @@ view (below) they inherit that instance's ambient span as the parent.
   table, CommandBus, buffer and sinks all shared; only the ambient span
   differs), and the four public methods (`call`/`dispatch`/`compose`/`run`)
   parent under their own instance's ambient span. Handler signatures are
-  untouched. This is Swift's `Kernel.$span.withValue(span) { body() }`
-  carried on the kernel value instead of the task, so Node and browser
-  behave identically.
+  untouched. The ambient span rides on the kernel value itself rather than
+  on a task-local, so Node and browser behave identically.
   - The one remaining edge: a handler that ignores its `kernel` argument and
     calls back through a kernel reference **captured from outside** bypasses
     the scoped view and mints roots — call through the argument.
-  - `dispatch` links too. This is deliberately **more than Swift**: the
-    Swift drain task's task-locals freeze at kernel construction
-    (CommandBus.swift:19-25), losing dispatch parentage, while the TS bus
-    carries closures that capture the scoped kernel, so the link comes for
-    free. When comparing traces cross-platform, what Swift shows as a root
-    the TS port shows nested.
+  - `dispatch` links too: the bus carries closures that capture the scoped
+    kernel, so a dispatched call parents under the span of the handler that
+    dispatched it — the link comes for free from how the bus is built.
 - Sequential stages within one `compose` do *not* parent each other — every
   stage shares the `parentSpan` the compose call itself received (always
   `undefined` for a top-level call) rather than inheriting the previous
-  stage's span. This is not a compromise but Swift's actual behavior:
-  `traced`'s `withValue` swaps the ambient only while the handler body runs,
-  and it has reverted by the time the next stage's `invoke` fires.
+  stage's span. This is deliberate, not a compromise: the ambient span is
+  scoped only to the running handler's body and has already reverted by the
+  time the next stage's `invoke` fires, so no stage inherits a sibling's
+  span.
 
 ## onTrace / TraceState
 
 Every `Kernel.invoke` pass can be recorded into `kernel.buffer`'s
-`TraceState` cell. The design follows the Swift side (`Trace.swift` /
-`Kernel+Trace.swift` / `MonitorDefaults.swift`) with one deliberate change
-driven by TS having no DEBUG/release split (the same bundle always runs).
+`TraceState` cell, with one deliberate design choice driven by TS having no
+DEBUG/release split (the same bundle always runs).
 
-**The sink signature carries no `id`.** Swift's `traceSink` receives
-`(symbol, verb, span, parent, payload, at)`, and the monotonic `id` is
-assigned only inside `TraceState.record` — the raw sink is thin, and
-"format into a `TraceEntry` and append to `TraceState`" is the default
-sink's job alone, the same relationship as `onError` /
-`KernelErrorState`. The TS port keeps this:
+**The sink signature carries no `id`.** The monotonic `id` is assigned only
+inside `appendTraceEntry` — the raw sink is thin, and "format into a
+`TraceEntry` and append to `TraceState`" is the default sink's job alone,
+the same relationship as `onError` / `KernelErrorState`:
 
 ```ts
 // src/trace.ts — the data-model module (same granularity as span.ts)
-export type TraceVerbKind = Verb<unknown>['kind']; // reuses 'next'|'abort'|'divert'|'fail'.
-                                                     // Swift keeps a separate TraceVerb enum, but
-                                                     // TS's Verb.kind is already the same discriminant.
+export type TraceVerbKind = Verb<unknown>['kind']; // reuses 'next'|'abort'|'divert'|'fail' —
+                                                     // Verb.kind is already the discriminant,
+                                                     // no separate enum needed.
 export type TraceSink = (
   symbolId: string,
   verb: TraceVerbKind,
-  span: Span,             // carries {id, parentId?} whole — folds Swift's (span, parent) pair into one argument
+  span: Span,             // carries {id, parentId?} whole — one argument instead of separate span/parent
   payload: string | undefined,
   timestamp: number,
 ) => void;
@@ -86,10 +78,10 @@ export interface TraceEntry {
 export interface TraceStateValue { readonly entries: readonly TraceEntry[]; }
 export const TraceState: StateKey<TraceStateValue> = defineState('TraceState', { entries: [] });
 
-// Same batch-trim policy as Swift's TraceState.record — trim once the ring overshoots
-// cap by 25%: removeFirst is O(cap), so the overshoot is dropped in one batch instead
-// of paying per append. The entry carries no id — it is assigned here (the raw sink
-// has none, as above).
+// Batch-trim policy: trim once the ring overshoots cap by 25%: removeFirst is
+// O(cap), so the overshoot is dropped in one batch instead of paying per
+// append. The entry carries no id — it is assigned here (the raw sink has
+// none, as above).
 export function appendTraceEntry(
   state: TraceStateValue,
   entry: Omit<TraceEntry, 'id'>,
@@ -100,20 +92,17 @@ export function appendTraceEntry(
 `TraceState` is not a built-in state that `BufferBuilder.build()` seeds
 unconditionally the way `KernelErrorState` is — `KernelBuilder.build()`
 looks at `options.tracing` and conditionally
-`allocateIfAbsent(TraceState)`s before freezing the buffer (the translation
-of Swift's "monitor state exists only in DEBUG builds" into the TS `tracing`
-flag). Left off, `kernel.buffer.read(TraceState)` throws
-`BufferError('unallocated')` like any other unallocated cell.
+`allocateIfAbsent(TraceState)`s before freezing the buffer. Left off,
+`kernel.buffer.read(TraceState)` throws `BufferError('unallocated')` like
+any other unallocated cell.
 
-**There is exactly one toggle.** Swift gates "calling the traceSink at all"
-(always, in DEBUG) and "payload rendering/snapshot via `recordsInspection`"
-in separate layers (in release builds `traced` itself becomes a
-passthrough and both disappear). TS has no such build split, so **one flag
-gates the whole recording** — off, neither payload rendering nor the
-`Buffer.mutate` into `TraceState` ever runs, and the only remaining cost is
-span minting (`crypto.randomUUID()`, which is paid unconditionally). It is
-not a two-tier toggle (recording vs payload rendering) because no concrete
-use case demands that granularity; it can be added when one does.
+**There is exactly one toggle.** TS has no DEBUG/release build split (the
+same bundle always runs), so **one flag gates the whole recording** — off,
+neither payload rendering nor the `Buffer.mutate` into `TraceState` ever
+runs, and the only remaining cost is span minting (`crypto.randomUUID()`,
+which is paid unconditionally). It is not a two-tier toggle (recording vs
+payload rendering) because no concrete use case demands that granularity;
+it can be added when one does.
 
 ```ts
 export interface KernelBuildOptions {
@@ -123,19 +112,18 @@ export interface KernelBuildOptions {
   tracing?: boolean;
   /** Injecting one replaces the default write into TraceState (same behavior as onError). */
   onTrace?: TraceSink;
-  /** The default sink's ring size. Default 300 (same value as Swift's MonitorOptions.traceCap). */
+  /** The default sink's ring size. Default 300. */
   traceCap?: number;
 }
 ```
 
-Payload rendering: zero-dep TS has no counterpart of Swift's `dump`
-(Mirror-based pretty-print), so `describeTracePayload` uses `JSON.stringify`
+Payload rendering: `describeTracePayload` uses `JSON.stringify`
 (with a replacer that summarizes binary buffer views as e.g.
 `"Uint8Array(3072)"` — see [trace-payload-rendering-cost](./trace-payload-rendering-cost.md)),
 falls back to `String(payload)` for non-serializable values (cycles,
-functions), and caps at 1024 characters with an ellipsis (the same behavior
-as Swift's `describePayload`). With `tracing` off, `Kernel.invoke` skips
-both this rendering and the `onTrace` call entirely.
+functions), and caps at 1024 characters with an ellipsis. With `tracing`
+off, `Kernel.invoke` skips both this rendering and the `onTrace` call
+entirely.
 
 **A handler that throws instead of `fail`ing is still recorded.** A handler
 bound with `register` (value-returning) has no way to return a `fail(...)`
@@ -171,6 +159,6 @@ guarantees that in both directions:
   reintroduce exactly the "failing handler invisible to the trace" problem
   the previous paragraph exists to prevent.
 
-Forest reconstruction (Swift's `TraceState.forest`, for call-tree UI) is not
-part of the core, and neither is delivery (WebSocket etc.) — the core stops
-at writing into `kernel.buffer`.
+Forest reconstruction (for call-tree UI) is not part of the core, and
+neither is delivery (WebSocket etc.) — the core stops at writing into
+`kernel.buffer`.

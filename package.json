@@ -1,7 +1,7 @@
 {
   "name": "@s-age/kernelee",
   "version": "0.5.0",
-  "description": "TypeScript port of swift-kernelee — core dispatch (KernelSymbol / Verb / KernelBuilder / Kernel / CommandBus) + pipes (Pipe / PipeBuilder / compose / run) + fork (parallel fan-out) + Buffer (observable state) + defineCallable (typed port factory, the @callable macro's TS counterpart)",
+  "description": "A message-kernel control framework for TypeScript — core dispatch (KernelSymbol / Verb / KernelBuilder / Kernel / CommandBus) + pipes (Pipe / PipeBuilder / compose / run) + fork (parallel fan-out) + Buffer (observable state) + defineCallable (typed port factory)",
   "type": "module",
   "license": "MIT",
   "repository": {

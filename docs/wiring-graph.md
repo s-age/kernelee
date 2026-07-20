@@ -5,14 +5,11 @@
 without running anything — including `fork(symbol)`'s dynamic fan-out (a
 `kind: 'fork(symbol)'` stage carries only `symbolId`; there is no branch
 count to record ahead of time, since "how many" is a runtime fact — see
-`pipes-and-fork.md`'s "Dynamic: fork(symbol)" section). Swift's `WiringGraphView`
-(`Sources/KernelDebugUI/WiringGraph.swift`) likewise renders an injected
-static snapshot of `[PipeDescriptor]`, not runtime events. The TS port
-carries "1 Pipe → 1 catalog entry" and "catalog → JSON graph document" as
+`pipes-and-fork.md`'s "Dynamic: fork(symbol)" section). This carries
+"1 Pipe → 1 catalog entry" and "catalog → JSON graph document" as
 two layers in `src/wiring-graph.ts`.
 
-**Layer 1 — `describePipe` is Swift's
-`PipeDescriptor(key:title:pipe:note:)`.**
+**Layer 1 — `describePipe` catalogs one `Pipe` under a key/title/note.**
 
 ```ts
 export interface PipeDescriptorEntry {
@@ -25,18 +22,17 @@ export interface PipeDescriptorEntry {
 export function describePipe(key: string, title: string, pipe: Pipe<any, any>, note?: string): PipeDescriptorEntry;
 ```
 
-Swift's `PipeDescriptor.inputType` (a runtime type name) is omitted — for
+`inputType` (a runtime type name) is omitted — for
 the same reason `StageDescriptor` omits `flows`/`inputType`: TS generics are
 erased at runtime, so it cannot be derived. There is no registry:
 `defineCallable` itself carries no static topology (`callable.ts`'s
 `mintedCallableIds` is a collision-detection ledger, not readable), and a
 symbol only appears in a descriptor once some `Pipe` stage references it. So
 the caller (the composition root) hand-builds the `PipeDescriptorEntry[]` —
-the same pattern as Swift consumers writing `[PipeDescriptor(...)]` array
-literals.
+a plain array literal, no registry involved.
 
-**Layer 2 — `projectWiringGraph` is a scope-reduced counterpart of Swift's
-`IndexProjection`/`IndexDocument`.**
+**Layer 2 — `projectWiringGraph` projects the catalog into a JSON wiring-graph
+document.**
 
 ```ts
 export function projectWiringGraph(
@@ -62,12 +58,9 @@ it is listed in `unresolvedDivertTargets` — so consumers of the document
 must read a non-empty `unresolvedDivertTargets` as "naming drift, or a
 deliberately uncatalogued external target", not automatically as a bug.
 
-Swift's `Sources/KernelIntrospect/IndexProjection.swift`/`IndexSchema.swift`
-are much broader (bindings, git/timestamp metadata, SwiftSyntax static-scan
-sections `states`/`parts`/`sharedStages`/`types`/`unresolved`) — the TS port
-takes only the "array catalog, no registry" pattern and the
-`PipeDescriptor` field shape. A panel UI can consume `WiringGraphDocument`
-as-is.
+`WiringGraphDocument` is deliberately scoped to wiring topology only — no
+bindings, git/timestamp metadata, or static-scan sections. A panel UI can
+consume it as-is.
 
 ## divertsTo validation (`validateWiringGraph`)
 
@@ -99,10 +92,9 @@ validation excludes it.
 **Not a compiler guarantee — the ceiling is explicit**: neither check can
 detect a *real but wrong* (swapped) key. The unresolved-target check only
 tests existence, and the orphan check only accidentally catches a mistagged
-key when its referrer count happens to drop to zero. swift-kernelee has no
-compile-time guarantee of this kind either (`Pipe.swift`'s doc comment is
-explicit: a divert's destination is decided at runtime, so static derivation
-is impossible in principle).
+key when its referrer count happens to drop to zero. This is a principled
+limitation, not an implementation gap: a divert's destination is decided at
+runtime, so static derivation is impossible in principle.
 
 **`orphanEntry` assumes the catalog is complete** — it is only meaningful
 against a catalog that enumerates the app's entire real dispatch surface. A
@@ -187,12 +179,6 @@ check; they remain the unchecked tier `validateWiringGraph` covers instead.
 | A pipe's typed declaration invisible to `build()` because the pipe itself was never registered via `flow()` | Runtime, at the first `divert` to that key (`Kernel`'s "never bound via `KernelBuilder.flow(...)`" throw) — the safety net for exactly this gap |
 | Raw/free-string `divertsTo`, or a hand-assembled `Diversion` | Unchecked — `validateWiringGraph`'s convention-level match, or nothing at all |
 | A *real but wrong* choice **among several correctly-declared, correctly-bound** typed targets | Not caught anywhere — a principled ceiling, not an oversight: which candidate is correct is a runtime decision by definition, and no tier above claims otherwise |
-
-The typed tier is TS-led: nothing in Swift forces a matching change, since
-`swift-kernelee`'s `Pipe.swift` carries the identical, deliberate free-text
-limitation today. A `DispatchKey`-shaped phantom generic struct (mirroring
-Swift's own `Symbol<P, O>`) would be the natural counterpart there, should
-the same problem get closed on that side too.
 
 **Alternative considered and rejected**: auto-registering a flow the moment
 its `DispatchKey` is minted (a module-level table populated on mint, so no

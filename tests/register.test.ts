@@ -7,9 +7,8 @@ import { KernelBuilder, KernelError, next, symbol } from '../src/index.js';
  * Registering the same symbol id twice must throw at the second `register`,
  * not silently last-write-win — *which handler answers a symbol* is the
  * runtime half of the architecture's guarantee, and the kernel must defend it
- * on its own. (Swift traps via `precondition`, observed through an exit test;
- * the TS translation throws, so a plain `expect(...).toThrowError` observes
- * it in-process.)
+ * on its own. A plain `expect(...).toThrowError` observes the throw
+ * in-process.
  */
 test('duplicateRegisterThrowsAtTheSecondBind', () => {
   const sym = symbol<number, number>('test.duplicate');

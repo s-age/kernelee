@@ -49,7 +49,7 @@ test('defineStateRejectsADuplicateId', () => {
   }
 });
 
-// MARK: - Allocation (Swift DefaultsTests: buffer provisioning)
+// MARK: - Allocation (buffer provisioning)
 
 test('buildSeedsKernelErrorStateWithoutAnyAllocateCall', () => {
   const buffer = new BufferBuilder().build();
@@ -57,9 +57,9 @@ test('buildSeedsKernelErrorStateWithoutAnyAllocateCall', () => {
 });
 
 test('explicitAllocationIsNotClobberedByTheDefaultSeeding', () => {
-  // Swift pre-seeds a custom KernelErrorState value; the TS seed rides on the
-  // key, so the observable half here is: build()'s allocateIfAbsent tolerates
-  // — and does not replace — an explicitly allocated framework cell.
+  // The seed rides on the key, so the observable half here is:
+  // build()'s allocateIfAbsent tolerates — and does not replace — an
+  // explicitly allocated framework cell.
   const builder = new BufferBuilder();
   builder.allocate(KernelErrorState);
   const buffer = builder.build(); // no 'duplicateAllocate' throw, no reseed
@@ -199,7 +199,7 @@ test('aThrowingListenerDoesNotStarveItsSiblings', () => {
   expect(hits).toEqual(['survivor']);
 });
 
-// MARK: - Default error sink (Swift DefaultsTests)
+// MARK: - Default error sink
 
 test('defaultErrorSinkRendersDispatchFailureIntoKernelErrorState', async () => {
   const builder = new KernelBuilder();
@@ -209,7 +209,7 @@ test('defaultErrorSinkRendersDispatchFailureIntoKernelErrorState', async () => {
   kernel.dispatch(boom, 1);
   await until(() => kernel.buffer.read(KernelErrorState).message !== null);
 
-  // Swift defaultErrorSink format: "symbol: description".
+  // Default error sink format: "symbol: description".
   expect(kernel.buffer.read(KernelErrorState).message).toBe('test.buffer.boom: went sideways');
 });
 

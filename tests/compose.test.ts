@@ -12,7 +12,7 @@ import {
   type Verb,
 } from '../src/index.js';
 
-// MARK: - Fixtures (Swift ComposeTests.swift, fork excluded)
+// MARK: - Fixtures (fork excluded)
 
 const increment = symbol<number, number>('test.increment');
 const stringify = symbol<number, string>('test.stringify');
@@ -25,7 +25,7 @@ const guardedSink = symbol<number, void>('test.guardedSink');
 
 class Boom extends Error {}
 
-/** Build a kernel wired with the leaf fixtures — the Swift `makeKernel()` idiom. */
+/** Build a kernel wired with the leaf fixtures. */
 function makeKernel(): Kernel {
   const builder = new KernelBuilder();
   builder.register(increment, (n) => n + 1);
@@ -54,9 +54,8 @@ test('builderCanBeComposedWithoutExplicitSeal', async () => {
 });
 
 /**
- * Swift asserts the `Void` boundary cast doesn't throw; TS has no boundary
- * cast at all, so the guarantee shrinks to "a void-output pipe resolves, and
- * resolves to undefined".
+ * TS has no boundary cast at all, so the guarantee here is "a void-output
+ * pipe resolves, and resolves to undefined".
  */
 test('voidOutputRoundTrips', async () => {
   const kernel = makeKernel();
@@ -147,10 +146,10 @@ test('runDrivesForwardAndStopsOnAbortWithoutAnOutputType', async () => {
 });
 
 /**
- * Swift: `compose` on this pipe would throw `composeTypeMismatch` (Int abort,
- * String output) while `run` doesn't cast at all. TS never checks the
- * boundary (the cast is deliberately unchecked), so the portable half of the guarantee is
- * forward-only-ness itself: `run` discards the final value — the abort's 999
+ * TS never checks the boundary (the cast is deliberately unchecked) — an
+ * Int abort would silently mismatch a String output. The guarantee that
+ * survives is forward-only-ness itself:
+ * `run` discards the final value — the abort's 999
  * never comes back.
  */
 test('runNeedsNoBoundaryCastSoAbortIsTypeFree', async () => {
@@ -263,10 +262,9 @@ test('failThrowsOutOfCompose', async () => {
   expect(hits).toEqual([]);
 });
 
-// (Swift's abortWithWrongTypeThrowsTypeMismatch is deliberately not ported:
-// the TS boundary cast is unchecked — there is no composeTypeMismatch.)
+// The TS boundary cast is unchecked — there is no composeTypeMismatch check.
 
-// MARK: - void-input sugar (TS-side symmetry with `call(sym)`; Swift has none)
+// MARK: - void-input sugar (symmetry with `call(sym)`)
 
 test('voidInputPipeComposesAndRunsWithoutAPayload', async () => {
   const seed = symbol<void, number>('test.seed');
@@ -285,8 +283,8 @@ test('voidInputPipeComposesAndRunsWithoutAPayload', async () => {
 test('builtPipeExposesItsStaticShapeWithoutRunning', () => {
   // No kernel, no execution — building the pipe records each stage's
   // descriptor, so a wiring graph can read the topology back without running
-  // anything. (Swift also asserts `flows`/`inputType` type names; TS generics
-  // are erased, so those fields don't exist in the port.)
+  // anything. (TS generics are erased, so `flows`/`inputType` type-name
+  // fields don't exist in the port.)
   const pipe = pipeline(increment) // pipe(symbol)  number -> number
     .pipe(stringify) //               pipe(symbol)  number -> string
     .map((s) => s.length) //          map           string -> number
@@ -343,8 +341,8 @@ test('mapAndEffectLiftAnOptionalMetaNoteIntoTheDescriptor', () => {
 test('tapLiftsAnOptionalMetaNoteOverTheSymbolDescription', () => {
   // tap(symbol) is the one symbol-backed stage with an author note channel:
   // the symbol's description says WHAT it does, the site's note says why it
-  // is tapped HERE — when both exist the author's note wins (Swift's
-  // `note ?? description`), and omitting meta keeps the plain transcription.
+  // is tapped HERE — when both exist the author's note wins, and omitting
+  // meta keeps the plain transcription.
   const documented = symbol<number, void>('test.save', 'persists the value');
   const pipe = pipeline(increment)
     .tap({ note: 'disk first — do not update state if the save fails' }, documented)

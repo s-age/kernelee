@@ -33,7 +33,7 @@ export interface KernelSymbol<in P, out O> {
 }
 
 /**
- * Mint a symbol. The Swift counterpart is `Symbol<P, O>.init(_:description:)`.
+ * Mint a symbol.
  *
  * ```ts
  * const fetchAll = symbol<void, Note[]>('storage.notes.fetchAll');

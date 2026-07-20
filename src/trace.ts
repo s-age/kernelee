@@ -5,17 +5,17 @@ import { defineState, type StateKey } from './buffer.js';
 // MARK: - TraceEntry
 
 /**
- * The verb discriminant a trace entry records. Swift keeps a separate
- * `TraceVerb` enum; TS's `Verb.kind` is already the same discriminant, so
- * reusing it (rather than minting a parallel vocabulary) is free.
+ * The verb discriminant a trace entry records: `Verb.kind` is already the
+ * discriminant, so reusing it (rather than minting a parallel vocabulary)
+ * is free.
  */
 export type TraceVerbKind = Verb<unknown>['kind'];
 
 /**
  * Notified once per `Kernel.invoke`, right after its handler resolves.
  * Deliberately thin, mirroring `onError`/`KernelErrorState`: the raw sink carries no `id`
- * (`span` already carries `{id, parentId?}`, folding Swift's separate
- * `(span, parent)` pair into one argument) — assigning the monotonic `id`
+ * (`span` already carries `{id, parentId?}` as one argument) —
+ * assigning the monotonic `id`
  * that lands in a `TraceEntry` is `appendTraceEntry`'s job alone, done only
  * once a sink chooses to record into {@link TraceState}.
  *
@@ -78,15 +78,13 @@ export interface TraceStateValue {
  * every other app state, not a special case wired inside `buffer.ts` (unlike
  * `KernelErrorState`, which is a release feature seeded unconditionally):
  * this cell is only allocated when `KernelBuildOptions.tracing` is on
- * (`KernelBuilder.build`), mirroring Swift's monitor states existing only in
- * DEBUG builds.
+ * (`KernelBuilder.build`).
  */
 export const TraceState: StateKey<TraceStateValue> = defineState<TraceStateValue>('TraceState', { entries: [] });
 
 /**
  * Append one entry, assigning its monotonic `id`, then trim once the ring
- * has overshot `cap` by 25% — Swift's `TraceState.record` batch-trim policy,
- * carried over verbatim: `Array.prototype.shift`-per-append is O(cap) each
+ * has overshot `cap` by 25%: `Array.prototype.shift`-per-append is O(cap) each
  * time, so paying it once per 1.25×`cap` entries (dropping straight to
  * `cap`) is cheaper than paying a smaller O(1)-amortized cost every append.
  */
@@ -105,7 +103,7 @@ export function appendTraceEntry(
 
 // MARK: - Payload rendering
 
-/** `describeTracePayload`'s truncation point — Swift's `describePayload` cap, carried over. */
+/** `describeTracePayload`'s truncation point. */
 const PAYLOAD_CAP = 1024;
 
 /**
@@ -140,9 +138,8 @@ function summarizeBinaryViews(_key: string, value: unknown): unknown {
 }
 
 /**
- * Render a traced payload to a bounded string. Swift's `dump` (a
- * `Mirror`-based pretty-printer) has no zero-dep TS equivalent, so this
- * falls back through two tiers: `JSON.stringify` for anything serializable,
+ * Render a traced payload to a bounded string. Falls back through two
+ * tiers: `JSON.stringify` for anything serializable,
  * then `String(payload)` for what throws (cycles, functions, `bigint`, …).
  * `undefined` in, `undefined` out — a `void`-payload symbol renders no
  * payload at all rather than the string `"undefined"`.

@@ -8,10 +8,9 @@ export type GateErrorCode = 'duplicateGateId';
 /**
  * The gate id ledger's own failure vocabulary — a *wiring-time programming
  * error*, never a runtime input, the same policy as `KernelError`/
- * `CallableError`/`BufferError` (Swift traps the equivalent with a
- * `precondition`; TS has no process-trapping precondition, so the same
- * programming error surfaces as an immediate throw at the second
- * `declareGate`, where the stack names the offender).
+ * `CallableError`/`BufferError` (TS has no process-trapping precondition, so
+ * the same class of programming error surfaces as an immediate throw at the
+ * second `declareGate`, where the stack names the offender).
  *
  * - `'duplicateGateId'` — a second `declareGate` minted the same id. Unlike
  *   `callable.ts`'s `mintedCallableIds` (which tolerates a same-*prefix*

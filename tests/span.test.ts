@@ -103,8 +103,8 @@ test('sequential pipe stages in one top-level compose are independent roots', as
   expect(hits).toHaveLength(2);
   // Neither stage was told about a parent — `compose`'s public signature has
   // no slot to receive one, so both mint as flow roots. See src/span.ts for
-  // why this (not chaining stage-to-stage) is the documented, Swift-faithful
-  // shape: Swift's own ambient span reverts between sibling stages too.
+  // why this (not chaining stage-to-stage) is the documented shape: the
+  // ambient span reverts between sibling stages.
   expect(hits.every((h) => h.span.parentId === undefined)).toBe(true);
   expect(hits.map((h) => h.span.id)).toEqual([...new Set(hits.map((h) => h.span.id))]); // distinct spans
 });
@@ -175,8 +175,7 @@ test("a composing handler's own kernel.call records the nested call as a child o
   const { hits, onTrace } = spanRecorder();
   const builder = new KernelBuilder();
   builder.register(increment, (n: number) => n + 1);
-  // Mirrors swift-kernelee ComposeTests.invokeBuildsACallTreeFromSpanAndParent:
-  // the composing handler calls back twice; both call-backs nest under it.
+  // The composing handler calls back twice; both call-backs nest under it.
   builder.register(
     sum,
     async (kernel: Kernel, n: number) => (await kernel.call(increment, n)) + (await kernel.call(increment, n)),
@@ -231,11 +230,11 @@ test("a handler's kernel.compose parents every stage under the handler's span", 
   expect(root?.span.parentId).toBeUndefined();
   expect(stages).toHaveLength(2);
   // Stages stay siblings under the handler (never chained to each other) —
-  // the same Swift-faithful flatness the top-level compose test pins above.
+  // the same flatness the top-level compose test pins above.
   expect(stages.every((stage) => stage.span.parentId === root?.span.id)).toBe(true);
 });
 
-test("a handler's kernel.dispatch links the command's span to the handler — beyond Swift, whose drain task cannot", async () => {
+test("a handler's kernel.dispatch links the command's span to the handler", async () => {
   const { hits, onTrace } = spanRecorder();
   let dispatchedSpan: Span | undefined;
   const builder = new KernelBuilder();
@@ -253,7 +252,7 @@ test("a handler's kernel.dispatch links the command's span to the handler — be
   const dispatched = hits.find((h) => h.symbolId === increment.id);
   // The enqueued closure captured the handler's span-scoped kernel, so the
   // linkage survives the bus's deferred execution (see Kernel.dispatch's doc
-  // for why this deliberately exceeds Swift's dispatch behavior). `dispatch`
+  // for why this link exists). `dispatch`
   // now mints its own root span first — parented under the handler — and the
   // command's own invoke nests one level further under *that*.
   expect(dispatchedSpan?.parentId).toBe(parent?.span.id);

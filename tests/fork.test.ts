@@ -10,7 +10,7 @@ import {
   type Kernel,
 } from '../src/index.js';
 
-// MARK: - Fixtures (Swift ForkTests.swift)
+// MARK: - Fixtures
 
 const identity = symbol<number, number>('fork.identity');
 const double = symbol<number, number>('fork.double');
@@ -19,10 +19,9 @@ const stringify = symbol<number, string>('fork.stringify');
 /** A verb-returning leaf: `fail`s on a negative input, to drive fork's fail-fast path. */
 const guarded = symbol<number, number>('fork.guarded');
 /**
- * Sleeps, then records that it ran to completion. Swift's `slow` also probes
- * *cancellation* (`slow:cancelled`); JS has no task cancellation, so the TS
- * fixture can only ever complete — which is exactly the semantic divergence
- * the settles-on-first-rejection tests pin down.
+ * Sleeps, then records that it ran to completion. JS has no task
+ * cancellation, so this fixture can only ever complete — which is exactly
+ * the behavior the settles-on-first-rejection tests pin down.
  */
 const slow = symbol<number, number>('fork.slow');
 
@@ -39,7 +38,7 @@ async function until(condition: () => boolean): Promise<void> {
   throw new Error('condition never held');
 }
 
-/** Build a kernel wired with the leaf fixtures — the Swift `makeKernel(probe:)` idiom. */
+/** Build a kernel wired with the leaf fixtures. */
 function makeKernel(hits: string[]): Kernel {
   const builder = new KernelBuilder();
   builder.register(identity, (n) => n);
@@ -58,9 +57,9 @@ function makeKernel(hits: string[]): Kernel {
 // MARK: - Tuple overloads (2/3/4) — success, order preserved
 
 /**
- * Beyond the Swift assertions (values + order), this proves *actual*
- * concurrency: each branch records its start before sleeping, so if fork ran
- * branches sequentially the second start would come after the first end.
+ * This proves *actual* concurrency (beyond values + order): each branch
+ * records its start before sleeping, so if fork ran branches sequentially
+ * the second start would come after the first end.
  */
 test('forkTwoRunsBranchesConcurrentlyAndPreservesOrder', async () => {
   const events: string[] = [];
@@ -155,13 +154,10 @@ test('forkFailFastSkipsDownstreamOnBranchFailure', async () => {
 });
 
 /**
- * Swift: `forkFailFastCancelsTheStillRunningSibling` — structured concurrency
- * *cancels* `slow` (the probe records `slow:cancelled`, never
- * `slow:completed`). Renamed here because the TS half of that guarantee is
- * deliberately smaller: `Promise.all` settles on the first rejection — the
- * caller observes the same fail-fast — but JS has no task cancellation, so
+ * `Promise.all` settles on the first rejection — the caller observes
+ * fail-fast — but JS has no task cancellation, so
  * the sibling **runs to completion in the background** and its result is
- * discarded. This test pins both halves of that divergence.
+ * discarded. This test pins both halves of that behavior.
  */
 test('forkFailFastSettlesOnFirstRejection', async () => {
   const hits: string[] = [];
@@ -176,11 +172,9 @@ test('forkFailFastSettlesOnFirstRejection', async () => {
 });
 
 /**
- * Swift: `forkArrayFailFastCancelsTheStillRunningSiblings` — same rename as
- * above. Swift needs this second proof because tuples (`async let`) and
- * arrays (`withThrowingTaskGroup`) are distinct concurrency code paths; the
- * TS port compiles both shapes to one `Promise.all` stage, so this pins the
- * array *overload* rather than a different runtime path.
+ * TS compiles both tuple and array shapes to one `Promise.all` stage, so
+ * this test exists to pin the array *overload* specifically, not a
+ * different runtime code path.
  */
 test('forkArrayFailFastSettlesOnFirstRejection', async () => {
   const hits: string[] = [];
@@ -192,7 +186,7 @@ test('forkArrayFailFastSettlesOnFirstRejection', async () => {
   expect(hits).toEqual(['slow:completed']);
 });
 
-// MARK: - Optional meta note (the relief valve — Swift `fork(note:)`)
+// MARK: - Optional meta note (the relief valve)
 
 test('forkLiftsAnOptionalMetaNoteIntoTheDescriptorAcrossEveryShape', () => {
   // `fork` needs the note valve least (its branches self-describe), but the
@@ -268,7 +262,7 @@ test('forkMetaTupleAndArrayStillRunAndPreserveOrder', async () => {
   expect(await kernel.compose(array, 3)).toEqual([6, 9, 3]);
 });
 
-// MARK: - TS additions (no Swift counterpart)
+// MARK: - Builder-sugar branches
 
 /** Fork accepts unsealed builders as branches — the same sugar `compose` has. */
 test('forkAcceptsUnsealedBuildersAsBranches', async () => {

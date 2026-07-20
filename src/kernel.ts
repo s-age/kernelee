@@ -31,15 +31,14 @@ export type KernelErrorCode = 'unbound' | 'duplicate' | 'emptyFanOut';
  * `PipeBuilder.fork`'s `fork(symbol)` overload in `pipe.ts`).
  *
  * - `'unbound'` — no binding was wired for the name: no handler for a symbol
- *   id at `invoke` (a forgotten `register` — mirrors Swift
- *   `KernelError.unbound`), or no flow for a dispatch key when a key-form
- *   `divert` resolves (a forgotten `flow`, on a pipe whose typed declaration
- *   `build()`'s assertion couldn't see — see `Kernel.#resolveFlowKey`).
+ *   id at `invoke` (a forgotten `register`), or no flow for a dispatch key
+ *   when a key-form `divert` resolves (a forgotten `flow`, on a pipe whose
+ *   typed declaration `build()`'s assertion couldn't see — see
+ *   `Kernel.#resolveFlowKey`).
  * - `'duplicate'` — a second binding for an already-bound name: a second
  *   `register` for a symbol id, or a second `flow()` for a dispatch key.
- *   Swift traps the symbol case with a `precondition`; TS has no
- *   process-trapping precondition, so the same programming error surfaces as
- *   an immediate throw at the second bind.
+ *   TS has no process-trapping precondition, so this class of programming
+ *   error surfaces as an immediate throw at the second bind.
  * - `'emptyFanOut'` — a `fork(symbol)` stage received an empty payload
  *   array. `fork(symbol)`'s `R[]` output can only be produced by actually
  *   running the symbol once per element; resolving `[]` for a zero-length
@@ -47,9 +46,8 @@ export type KernelErrorCode = 'unbound' | 'duplicate' | 'emptyFanOut';
  *   without the symbol ever running, so this throws instead — `symbolId` is
  *   the fanned-out symbol's id.
  *
- * Swift's `composeTypeMismatch` has no counterpart here: TS generics are
- * fully erased, so the terminator boundary cast is unchecked (see
- * `Kernel.#interpret`).
+ * TS generics are fully erased, so the terminator boundary cast is
+ * unchecked (see `Kernel.#interpret`).
  */
 export class KernelError extends Error {
   override readonly name = 'KernelError';
@@ -100,9 +98,9 @@ export interface KernelBuildOptions {
    * `Kernel.reportDetached`). `source` names what failed: the dispatched
    * command's symbol id, or a detached branch's label (the fork stage's
    * `note`, else `'fork.untracked'`). Omitted, failures are rendered into the
-   * buffer's `KernelErrorState` cell as `"source: message"` (Swift's
-   * `defaultErrorSink`); an injected sink replaces that default entirely —
-   * `KernelErrorState` then stays untouched.
+   * buffer's `KernelErrorState` cell as `"source: message"`; an injected sink
+   * replaces that default entirely — `KernelErrorState` then stays
+   * untouched.
    *
    * That a detached branch's failure lands here is the *structural* resolution
    * of the old "`kernel.run(pipe)` has no error sink" residue: a fire-and-
@@ -132,11 +130,9 @@ export interface KernelBuildOptions {
    * Master switch for trace recording. Default
    * `false`. Off, `Kernel.invoke` pays only the span-minting cost it already
    * pays unconditionally — no payload rendering, no
-   * `Buffer.mutate` call. Unlike Swift's two-tier "record always in DEBUG,
-   * gate only payload rendering/snapshot separately" split, TS has no
-   * DEBUG/release build separation to make that split free, so one flag
-   * gates the whole thing; a finer-grained toggle can be added if a concrete
-   * need for it shows up.
+   * `Buffer.mutate` call. TS has no DEBUG/release build separation, so one
+   * flag gates the whole thing; a finer-grained toggle (recording vs.
+   * payload rendering) can be added if a concrete need for it shows up.
    */
   tracing?: boolean;
   /**
@@ -147,7 +143,7 @@ export interface KernelBuildOptions {
    * an injected sink replaces that default write entirely.
    */
   onTrace?: TraceSink;
-  /** Default sink's ring size. Default 300 (Swift's `MonitorOptions.traceCap`). */
+  /** Default sink's ring size. Default 300. */
   traceCap?: number;
 }
 
@@ -267,9 +263,8 @@ export class KernelBuilder {
    * last-write-win, and which handler answers a symbol is the runtime half of
    * the architecture's guarantee, so a duplicate throws immediately at the
    * second register (where the stack names the offender) rather than
-   * surfacing as the wrong device answering on some cold path. (Swift makes
-   * this a `precondition` trap; the TS equivalent of "programming error,
-   * never an input" is an unconditional throw.)
+   * surfacing as the wrong device answering on some cold path. (A
+   * programming error, never an input, so it is an unconditional throw.)
    */
   #bind(id: string, handler: ErasedHandler): void {
     if (this.#handlers.has(id)) {
@@ -345,9 +340,8 @@ export class KernelBuilder {
    * Same leaf/composing discrimination as {@link register} — and the same
    * caveat: default/rest parameters break it.
    *
-   * (Swift overloads `register` on the handler's return type; TS overload
-   * resolution cannot discriminate on return type reliably, hence the
-   * separate name.)
+   * (TS overload resolution cannot discriminate on return type reliably,
+   * hence the separate name.)
    */
   registerVerb<P, O>(sym: KernelSymbol<P, O>, handler: (payload: P) => Verb<O> | Promise<Verb<O>>): void;
   /** @internal */
@@ -612,8 +606,7 @@ export class KernelBuilder {
    *
    * `TraceState` is allocated only when `tracing` is on
    * — unlike `KernelErrorState`, which `BufferBuilder.build()` seeds
-   * unconditionally as a release feature, trace recording mirrors Swift's
-   * monitor states existing only in DEBUG builds. The allocate happens here,
+   * unconditionally as a release feature. The allocate happens here,
    * before the buffer freezes, since `KernelBuildOptions.tracing` is only
    * known at this call, not to `BufferBuilder` itself.
    *
@@ -642,9 +635,8 @@ export class KernelBuilder {
    * The error sink `build` falls back to when the caller injects none: render
    * the failed `source` (a dispatched command's symbol id, or a detached fork
    * branch's label — see {@link KernelBuildOptions.onError}) and the error
-   * message into `KernelErrorState`. Swift's `defaultErrorSink`, verbatim
-   * (`"\(symbol): \(error.localizedDescription)"` becomes `"source: message"`)
-   * — both `dispatch` and a detached branch swallow the error toward this sink
+   * message into `KernelErrorState`, formatted as `"source: message"` —
+   * both `dispatch` and a detached branch swallow the error toward this sink
    * either way, and a silently dropped failure is the worse default.
    */
   static #defaultErrorSink(buffer: Buffer): (source: string, error: unknown) => void {
@@ -726,10 +718,9 @@ export class Kernel {
    * The span enclosing every public call made *through this instance* —
    * `undefined` on the kernel `build()` returns (top-level calls are flow
    * roots), the handler's own span on the span-scoped view `invoke` hands to
-   * each handler (span linking). The TS stand-in for Swift's
-   * `@TaskLocal` ambient span, carried on the kernel *value* instead of the
-   * task, so it behaves identically in Node and the browser — see
-   * [[span.ts]].
+   * each handler (span linking). This ambient span is carried on the kernel
+   * *value* itself rather than on a task-local, so it behaves identically in
+   * Node and the browser — see [[span.ts]].
    */
   readonly #ambientSpan: Span | undefined;
   /**
@@ -928,9 +919,9 @@ export class Kernel {
    * call is a flow root), the handler's span on the span-scoped view a
    * running handler receives (span linking); see [[span.ts]] for the
    * design. A span is minted unconditionally (the cost is one
-   * `crypto.randomUUID()` call) — mirroring Swift's `traced`, where the
-   * record happens once the body returns, so a child's span/parent pair is
-   * always observed before its parent's. When `tracing` is on,
+   * `crypto.randomUUID()` call); the record happens once the body returns,
+   * so a child's span/parent pair is always observed before its parent's.
+   * When `tracing` is on,
    * `onTrace` is then notified with the *input*
    * payload (rendered via `describeTracePayload`) and the resolved verb's
    * `kind`; off, that formatting and the sink call are skipped entirely.
@@ -961,9 +952,8 @@ export class Kernel {
     }
     const span = mintSpan(parentSpan ?? this.#ambientSpan);
     // The handler runs against a span-scoped view of this kernel, so its own
-    // call-backs parent under the span just minted — Swift's
-    // `Kernel.$span.withValue(span) { body() }`, carried on the kernel value
-    // instead of the task (span linking; see [[span.ts]]). Skipped
+    // call-backs parent under the span just minted (span linking, carried on
+    // the kernel value itself; see [[span.ts]]). Skipped
     // when tracing is off: spans are unobservable then, and the root kernel
     // behaves identically in every other respect.
     const kernel = this.#onTrace === undefined ? this : this.#scoped(span);
@@ -1025,7 +1015,7 @@ export class Kernel {
    * pipeline: invoke the handler, then interpret the verb down to `O`.
    *
    * The no-payload overload is sugar for the many `void`-payload endpoints:
-   * `kernel.call(sym)` (Swift's `call(_: Symbol<Void, O>)` extension).
+   * `kernel.call(sym)`.
    */
   call<O>(sym: KernelSymbol<void, O>): Promise<O>;
   call<P, O>(sym: KernelSymbol<P, O>, payload: P): Promise<O>;
@@ -1051,11 +1041,8 @@ export class Kernel {
    * Span parentage (span linking): dispatched from inside a handler
    * (through the span-scoped kernel the handler received), the command's span
    * records that handler as its parent — the enqueued closure captures the
-   * scoped `this`, so the linkage survives the bus's deferred execution.
-   * Deliberately *more* than Swift, whose drain task freezes its task-locals
-   * at kernel construction (CommandBus.swift:19-25) and so loses dispatch
-   * parentage; here the truthful causal link is free, and cross-platform
-   * trace comparisons should expect TS to nest what Swift shows as a root.
+   * scoped `this`, so the linkage survives the bus's deferred execution; the
+   * truthful causal link comes for free from how the bus is built.
    *
    * **Returns the dispatched flow's root `Span`** — minted synchronously,
    * before the serial bus defers the enqueued work — so the caller has a
@@ -1073,10 +1060,9 @@ export class Kernel {
    * Backward compatible: callers that treated `dispatch` as `void` are
    * unaffected — they simply discard a return value they never asked for.
    *
-   * Cross-platform: Swift's `dispatch` returns `void`; returning the root
-   * span here is a deliberate TS-side divergence, consistent with the
-   * parentage note above — TS `dispatch` already links causally where Swift
-   * cannot, and now it also hands back the correlation handle for it.
+   * Returning the root span here (rather than `void`) is deliberate:
+   * `dispatch` already links causally (see the parentage note above), so
+   * handing back the correlation handle for it is a natural extension.
    */
   dispatch<P, O>(sym: KernelSymbol<P, O>, payload: P): Span;
   dispatch<P, O>(action: Action<P, O>): Span;
@@ -1111,20 +1097,18 @@ export class Kernel {
   }
 
   /**
-   * Run a sealed pipe (or, as sugar, an unsealed builder — Swift has the same
-   * convenience) and hand back its final value, typed as the pipe's declared
+   * Run a sealed pipe (or, as sugar, an unsealed builder) and hand back its
+   * final value, typed as the pipe's declared
    * `O`. "Final" means whatever terminated the run: the last stage's `next`,
    * an `abort`'s value, or a diverted-to pipe's own result — every terminator
    * leaves through this single boundary.
    *
-   * Boundary cast: deliberately unchecked (`as O`) — Swift
-   * re-checks the value here and throws `composeTypeMismatch` on a lying
-   * `abort`/`divert`; TS generics are erased, so a mismatch surfaces at the
-   * use site instead.
+   * Boundary cast: deliberately unchecked (`as O`) — TS generics are
+   * erased, so a mismatched `abort`/`divert` value surfaces at the use site
+   * instead of at this boundary.
    *
    * The no-payload overload is sugar for `Pipe<void, O>` pipelines,
-   * mirroring `call(sym)` — a TS-side symmetry; Swift has no `Void`
-   * `compose` convenience.
+   * mirroring `call(sym)`.
    */
   compose<O>(target: Pipe<void, O> | PipeBuilder<void, O>): Promise<O>;
   compose<I, O>(target: Pipe<I, O> | PipeBuilder<I, O>, payload: I): Promise<O>;
@@ -1159,8 +1143,7 @@ export class Kernel {
    * error itself. The sink call is guarded: a throwing sink must not turn a
    * detached-branch failure into an unhandled rejection (the same "the bus
    * only sequences; a throwing sink can't poison it" safety net `CommandBus`
-   * keeps — see `command-bus.ts`). This is the counterpart of Swift routing a
-   * detached `Task {}`'s error to its own `errorSink`.
+   * keeps — see `command-bus.ts`).
    */
   reportDetached(source: string, error: unknown): void {
     try {
@@ -1178,8 +1161,7 @@ export class Kernel {
    * same iterative `#runStages`, so a diverted-to loop is still O(1) stack);
    * `fail` throws.
    *
-   * Boundary cast: Swift re-checks the terminator's value against `O` here
-   * and throws `composeTypeMismatch` on a lie. TS generics are erased, so the
+   * Boundary cast: TS generics are erased, so the
    * `as O` casts are unchecked — a mismatched `abort`/`divert` value surfaces
    * at the use site instead of at this boundary.
    */
@@ -1193,10 +1175,10 @@ export class Kernel {
         // Runs under this instance's *own* ambient span (`undefined` on the
         // built kernel): by interpret time the handler that returned this
         // divert has already closed its span, so the diverted-to stages
-        // parent under the caller's enclosing span — exactly Swift, where
-        // traced's ambient has reverted to the caller's binding when
-        // interpret runs (it only wraps invoke's handler call, not the
-        // interpretation that follows it).
+        // parent under the caller's enclosing span (the ambient span from
+        // the handler's own invoke call has already reverted — it only
+        // wraps invoke's handler call, not the interpretation that follows
+        // it).
         //
         // Two `Diversion` shapes (see that type's own doc comment): the
         // unchecked `{ stages, payload }` resolves for free (it already
@@ -1223,9 +1205,8 @@ export class Kernel {
    * call to unwind — each hop discards the previous one's stage list outright
    * rather than waiting on it.
    *
-   * Carried over in full (Swift `runStages`, verbatim) because
-   * `call`'s `divert` interpretation already needs it;
-   * `compose`/`run` are thin typed wrappers over it.
+   * Not `#`-private because `call`'s `divert` interpretation already needs
+   * it; `compose`/`run` are thin typed wrappers over it.
    *
    * `parentSpan` is constant for the *entire* call, including
    * across a `divert` jump: a divert replaces `stages`/`value` but keeps

@@ -26,22 +26,20 @@ toDto.descriptors;                            // static shape readable without r
 
 - **Every symbol stage goes through `kernel.invoke` (the single
   chokepoint)**. Anonymous stages (`pipe(meta, verbFn)` / `map` / `effect`)
-  run their closure directly (same as Swift — only symbol traffic shows up
-  in a trace).
+  run their closure directly (only symbol traffic shows up in a trace).
 - **`divert` is iteration, not recursion**: it swaps the stage list and value
   and continues from index 0, so a self-diverting loop (an agent loop) stays
   O(1) stack across any number of hops.
 - **A `tap`'s verb governs the pipe**: the output (void) is discarded and the
   original value flows on, but a tapped handler's `fail` stops the pipe.
 - Anonymous verb stages are discriminated by `meta = { note: string,
-  divertsTo?: string[] }` (the translation of Swift's labeled arguments
-  `note:`/`divertsTo:`; `note` doubles as the discriminant, so it is
+  divertsTo?: string[] }` (`note` doubles as the discriminant, so it is
   required). Mid-chain `.pipe(meta, (kernel, cursor) => …)` needs no lambda
   annotations (the cursor type is known). The entry form
   `pipeline(meta, (kernel: Kernel, p: P) => …)` does (nothing pins `P`).
 - `tap` / `map` / `effect` also accept an optional leading `meta = { note }`
   to attach an author note; on `tap(meta, sym)` the author's note wins over
-  the symbol's description (Swift's `note ?? description`).
+  the symbol's description.
 
 ## fork
 
@@ -56,8 +54,8 @@ the `StageDescriptor` records, how many times a thing runs — differs.
 
 Fan the current value out to N independent branches (each a sealed sub-pipe —
 passing a builder works as sugar), run them concurrently, and collect
-**order-preserved** results. Two shapes: heterogeneous tuples (2–4 arguments,
-matching Swift's overload set) and homogeneous arrays. There is no dedicated
+**order-preserved** results. Two shapes: heterogeneous tuples (2–4 arguments)
+and homogeneous arrays. There is no dedicated
 join API — `.map` / `.pipe` on the tuple/array output *is* the join (the
 "transistor").
 
@@ -72,8 +70,7 @@ const all = pipeline(fetchIds)
   .seal();
 ```
 
-Verb semantics inside a branch (each branch is one whole `compose`, same as
-Swift):
+Verb semantics inside a branch (each branch is one whole `compose`):
 
 - `abort` — terminates **that branch only**; the abort value becomes that
   slot's result. The fork continues.
@@ -81,19 +78,16 @@ Swift):
 - `fail` — the whole fork (= the outer pipe) rejects. Downstream stages never
   run.
 
-**Cancellation semantics differ from Swift (important)**: Swift's structured
-concurrency (`async let` / task groups) cancels *running siblings* when one
-branch fails. JS has no task cancellation — the implementation is
-`Promise.all`, so the fork settles on the first rejection (the fail-fast
-*outcome* is the same), but **sibling branches run to completion in the
-background** and their results (or later rejections) are discarded (the
-*resources* differ). Write branches so that a wasted full run is safe.
-`AbortSignal` support is future scope.
+**Cancellation semantics (important)**: JS has no task cancellation — the
+implementation is `Promise.all`, so the fork settles on the first rejection,
+but **sibling branches run to completion in the background** and their
+results (or later rejections) are discarded. Write branches so that a
+wasted full run is safe. `AbortSignal` support is future scope.
 
 Static shape: a fork stage's `StageDescriptor` has `kind: 'fork(branches)'`
 and `branches` (each branch's own descriptors, in fork order). On non-fork
-stages `branches` is `undefined` (Swift defaults it to an empty array; the TS
-port represents absence). There used to also be a `branchArity` field
+stages `branches` is `undefined` (absence is represented directly, not as an
+empty array). There used to also be a `branchArity` field
 (`fixedArity(n)` / `runtimeArity`, declaring whether the branch count was
 structural or sized per invocation) — removed once `fork(symbol)` (below)
 gave the "sized per invocation" case a real, non-workaround vocabulary of its

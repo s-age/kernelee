@@ -48,11 +48,9 @@ import { divert, next, type ErasedStage, type Verb } from './verb.js';
  * hidden second argument — see the removed `pipeAdapt`/`tapAdapt` kinds this
  * vocabulary superseded.
  *
- * Swift's `StageDescriptor.Kind`, adapted vocabulary (TS split the method
- * from the operand where Swift's `verb` stayed a single flat case). Ten
- * literals, not Swift's flat `verb` case — `fork(symbol)` has no Swift
- * counterpart yet (see {@link PipeBuilder.fork}'s doc comment on the
- * `.fork(sym)` overload).
+ * The stage-kind vocabulary splits the method from the operand — ten
+ * literals total (see {@link PipeBuilder.fork}'s doc comment on the
+ * `.fork(sym)` overload for `fork(symbol)`, the newest addition).
  */
 export type StageKind =
   | 'pipe(symbol)'
@@ -78,12 +76,12 @@ export type StageKind =
  * runtime-decided and can never be derived, but an author can still name the
  * candidates.
  *
- * Deliberately slimmer than Swift's `StageDescriptor`:
- * - no `wireSite` — Swift captures `#filePath`/`#line` at the `.pipe`/`.map`
- *   call; TS has no compile-time source-location default arguments, and the
- *   port decided against faking one (a deliberate design decision).
- * - no `flows`/`inputType` — Swift renders `"\(Next.self)"`; TS generics are
- *   erased, so there is no runtime type name to record.
+ * Deliberately excludes two fields:
+ * - no `wireSite` — TS has no compile-time source-location default
+ *   arguments, and faking one was decided against (a deliberate design
+ *   decision).
+ * - no `flows`/`inputType` — TS generics are erased, so there is no runtime
+ *   type name to record.
  */
 export interface StageDescriptor {
   readonly kind: StageKind;
@@ -109,8 +107,7 @@ export interface StageDescriptor {
    * `(function)` variants, a `handlerName` besides). `undefined` for an
    * undocumented symbol, or a `map`/`effect`/`fork(branches)` stage whose
    * author declined the optional note (a `pipe` stage's `note` is required,
-   * so that case never arises there). (Swift folds both into
-   * `StageDescriptor.description`; the TS field is named after the
+   * so that case never arises there). (The field is named after the
    * anonymous-stage `note` that most often fills it.)
    */
   readonly note?: string;
@@ -140,9 +137,8 @@ export interface StageDescriptor {
    * `Pipe`), in the order they were forked. `undefined` for every other kind
    * — including `fork(symbol)`, whose fan-out is a runtime-sized list of
    * payloads to the *same* symbol, not a construction-time list of distinct
-   * sub-`Pipe`s, so there is no `branches` tree to nest. (Swift defaults this
-   * to `[]` on non-fork stages; the TS port spells "not a fork(branches)
-   * stage" as absence.)
+   * sub-`Pipe`s, so there is no `branches` tree to nest. (Absence, not `[]`,
+   * spells "not a `fork(branches)` stage".)
    */
   readonly branches?: readonly (readonly StageDescriptor[])[];
   /**
@@ -166,8 +162,7 @@ export interface StageDescriptor {
    * `flattenStages` in `wiring-graph.ts`.
    *
    * Additive JSON-shape change: bumps `WiringGraphDocument.schemaVersion`
-   * (4 → 5). Swift's `StageDescriptor` gains the counterpart
-   * (`untrackedBranches: [[StageDescriptor]]`, default `[]`).
+   * (4 → 5).
    */
   readonly untrackedBranches?: readonly (readonly StageDescriptor[])[];
   /**
@@ -202,7 +197,7 @@ export interface StageDescriptor {
  * One pipeline step: its static `descriptor` plus the type-erased `run`
  * closure. The erasure is safe because construction (`PipeBuilder.pipe`) pins
  * both ends via the `KernelSymbol` / `Verb<Next>` signatures — the same
- * discipline as `KernelBuilder`'s casts. Swift counterpart: `PipeStage`.
+ * discipline as `KernelBuilder`'s casts.
  *
  * @internal Not exported from the package index — `Diversion` and the
  * kernel's stage runner consume only the `run` half (`ErasedStage`).
@@ -258,8 +253,8 @@ export type VerbStageFn<Cursor, Next> = (
  * Labels an anonymous verb stage. Anonymous stages carry no symbol, hence no
  * lifted description — `note` says what the guard/rule does, and doubles as
  * the runtime discriminator that tells `.pipe(meta, fn)` apart from
- * `.pipe(symbol)` (which is why it is required where Swift's `note:` is
- * optional). `divertsTo` optionally names the dispatch key(s) the stage might
+ * `.pipe(symbol)` (which is why it is required). `divertsTo` optionally
+ * names the dispatch key(s) the stage might
  * `divert` to — see {@link StageDescriptor.divertsTo}.
  */
 export interface VerbStageMeta {
@@ -369,22 +364,6 @@ function buildDivertChannel<T extends DivertTargets>(targets: T): DivertChannel<
  * sub-pipes), so only the fork's own "why fan out at this point" ever goes
  * unaccounted for — everything the branches *do* is already tokenized.
  *
- * Swift already has this: `PipeBuilder.map`/`.effect` and every `fork`
- * overload (`Pipe.swift`/`PipeBuilder+Fork.swift`) take a trailing
- * `note: String? = nil` labeled parameter — Swift's `note` has been optional
- * across *every* stage-building method (`pipe`/`tap`/`map`/`effect`/`fork`)
- * from the start, including the anonymous-verb-equivalent `pipe(note:, …)`
- * (see the "required where Swift's `note:` is optional" remark on
- * {@link VerbStageMeta}). This TS type is a **capability catch-up**, not a
- * TS-only extension: TS already matched Swift for `verb` (by choosing
- * *required*, deliberately, for the discriminator reason above); it did not
- * yet match Swift for `map`/`effect`/`fork`, where TS had no note channel at
- * all. No new Swift-side work follows from this — only a shape difference
- * remains (a leading `{ note }` object here vs. a trailing labeled
- * parameter there, and Swift's `note:` still rides along with its
- * `#filePath`/`#line` capture, which this port already declined to fake —
- * see {@link StageDescriptor}'s "no `wireSite`" note above).
- *
  * Being a plain data object (prototype chain bottoms out at `Object.prototype`
  * or `null` immediately) is itself part of the discrimination contract — see
  * `isStageMeta` in pipe.ts. Do not construct a `meta` value from a class
@@ -399,7 +378,7 @@ export interface StageMeta {
 /**
  * What `fork` accepts as one branch: a sealed `Pipe` or, as sugar, an
  * unsealed `PipeBuilder` (fork seals it on the spot — same convenience as
- * `kernel.compose(builder, …)`; Swift's `fork` takes sealed `Pipe`s only).
+ * `kernel.compose(builder, …)`).
  * `Cursor` is the forking pipe's current value — every branch receives it —
  * and `R` is that branch's own result. Strictly: only a `Pipe`/`PipeBuilder`
  * constructed by *this* kernelee module instance qualifies — a cross-copy
@@ -515,8 +494,8 @@ export class PipeBuilder<in Input, out Cursor> {
    *
    * Second shape — `pipe(meta, verbFn)`: an anonymous verb-returning stage
    * (see {@link VerbStageFn}). Runs its closure directly, **not** through
-   * `kernel.invoke` — same as Swift, where only symbol-backed stages hit the
-   * chokepoint (that is what makes a trace read as symbol traffic).
+   * `kernel.invoke` — only symbol-backed stages hit the chokepoint (that is
+   * what makes a trace read as symbol traffic).
    *
    * Third shape — `pipe(typedMeta, typedVerbFn)`: the checked-divert twin of
    * the second shape. `typedMeta.divertsTo` is a {@link DivertTargets} map
@@ -600,8 +579,8 @@ export class PipeBuilder<in Input, out Cursor> {
    *
    * Optional leading `meta` ({@link StageMeta}) — the author's site context
    * ("why tap *here*"); when supplied it wins over the symbol's own
-   * `description` in the descriptor (Swift's `note ?? description`). Same
-   * non-breaking arity-based dispatch as `.map`/`.effect`.
+   * `description` in the descriptor. Same non-breaking arity-based dispatch
+   * as `.map`/`.effect`.
    */
   tap(symbol: KernelSymbol<Cursor, void>): PipeBuilder<Input, Cursor>;
   tap(meta: StageMeta, symbol: KernelSymbol<Cursor, void>): PipeBuilder<Input, Cursor>;
@@ -698,20 +677,17 @@ export class PipeBuilder<in Input, out Cursor> {
    * Fan the current value out to N independent branches (each a sub `Pipe`
    * run via `kernel.compose`), run them concurrently, and collect their
    * results into an order-preserving tuple (heterogeneous overloads, 2–4
-   * branches — matching Swift's overload set) or array (homogeneous overload,
-   * unbounded). `.map`/`.pipe` on the tuple/array output is the "transistor"
-   * that recombines the branches — no dedicated join combinator exists.
+   * branches) or array (homogeneous overload, unbounded). `.map`/`.pipe` on
+   * the tuple/array output is the "transistor" that recombines the
+   * branches — no dedicated join combinator exists.
    *
-   * Branch verbs, exactly as in Swift (each branch is a full `compose`):
-   * a branch's `abort` terminates *that branch* and its value becomes the
-   * branch's slot in the result — the fork keeps going; a branch's `divert`
-   * runs the target pipe and *its* result fills the slot; a branch's `fail`
-   * rejects the whole fork (and thereby the enclosing pipe) — downstream
-   * stages never run.
+   * Branch verbs (each branch is a full `compose`): a branch's `abort`
+   * terminates *that branch* and its value becomes the branch's slot in the
+   * result — the fork keeps going; a branch's `divert` runs the target pipe
+   * and *its* result fills the slot; a branch's `fail` rejects the whole
+   * fork (and thereby the enclosing pipe) — downstream stages never run.
    *
-   * **Fail-fast semantics differ from Swift in resources, not in results.**
-   * Swift's structured concurrency (`async let` / task group) *cancels* the
-   * still-running siblings the moment one branch throws. JS has no task
+   * **Fail-fast in results, not in resources.** JS has no task
    * cancellation: `Promise.all` settles on the first rejection — the fork
    * (and the pipe) fails just as fast — but **the sibling branches keep
    * running to completion in the background**; their results (or their own
@@ -949,12 +925,11 @@ export class PipeBuilder<in Input, out Cursor> {
   }
 
   /**
-   * The one fork stage both shapes compile to. Swift needs two runtime
-   * strategies (`async let` for tuples, `withThrowingTaskGroup` for arrays —
-   * `async let` can't express a dynamic arity); `Promise.all` covers both,
-   * and a JS "tuple" *is* an array, so tuple and array overloads share this
-   * single code path. Order preservation is `Promise.all`'s own guarantee:
-   * results land by submission index, never by completion order.
+   * The one fork stage both shapes compile to: `Promise.all` covers both
+   * tuple and array cases, since a JS "tuple" *is* an array, so tuple and
+   * array overloads share this single code path. Order preservation is
+   * `Promise.all`'s own guarantee: results land by submission index, never
+   * by completion order.
    *
    * Branches run through `kernel.runStages` directly, not the
    * public `compose` — `compose` is a fixed two-argument signature

@@ -1,16 +1,14 @@
-# defineCallable (the TS version of the `@callable` macro)
+# defineCallable
 
-Swift's `@callable("Id.Prefix")` generates a `<Protocol>Callable` enum (one
-typed `Symbol` per method + `wire(_:into:)`) from a device protocol. TS has
-no macros, so the port is a **typed factory function** (codegen was
-rejected): the spec object is the single denominator from which the symbols,
-the device type and the wiring are all derived.
+TS has no macros, so a port is declared via a **typed factory function**
+(codegen was rejected): the spec object is the single denominator from which
+the symbols, the device type and the wiring are all derived.
 
 ```ts
 import { defineCallable, port, portK, portV, portKV, type CallableDeviceOf } from '@s-age/kernelee';
 
-// Port declaration — corresponds to one @callable protocol in Swift.
-// docs are explicit port() arguments (TS can't read JSDoc at runtime — a documented non-correspondence).
+// Port declaration — the spec object is the single source of truth.
+// docs are explicit port() arguments (TS can't read JSDoc at runtime).
 export const LifePort = defineCallable('Compute.Life', {
   stepChunk: port<ChunkInput, ChunkResult>('advance a row chunk one generation'), // leaf, value-returning
   reset:     portK<void, void>('reset the board and generation'),                 // composing (kernel-first), value-returning
@@ -36,24 +34,20 @@ LifePort.wire(device, builder); // one register/registerVerb per spec key
 
 1. **forward** — `wire`'s `CallableDevice<Spec>` constraint forces every
    method to be implemented (a missing implementation or payload type
-   mismatch is a tsc error; in Swift, protocol conformance does this).
-2. **reverse** — consumers can only call through the `LifePort.xxx` symbols
-   (in Swift, the `any Protocol` use sites do this).
+   mismatch is a tsc error).
+2. **reverse** — consumers can only call through the `LifePort.xxx` symbols.
 3. **wire** — the spec is the single denominator: one register is generated
    per spec key, so none can be forgotten (pinned in CI by the
    `builder.boundSymbolIds` exhaustiveness smoke test).
 
-The markers map 1:1 onto Swift's four `register` overloads (value/verb ×
-leaf/composing):
+The markers form a 2×2 matrix (value/verb × leaf/composing):
 
 - `port<P, O>(doc?)` — leaf, value-returning: `(payload) => O | Promise<O>`
 - `portK<P, O>(doc?)` — composing, value-returning:
-  `(kernel, payload) => O | Promise<O>` (Swift discriminates on "first
-  parameter is `Kernel`-typed"; TS can't read types at runtime, so the
-  marker is declared)
+  `(kernel, payload) => O | Promise<O>` (TS can't read types at runtime, so
+  the marker is declared explicitly)
 - `portV<P, O>(doc?)` — leaf, verb-returning:
-  `(payload) => Verb<O> | Promise<Verb<O>>` (Swift handles this *implicitly*
-  through `register` overload resolution — TS already splits the name into
+  `(payload) => Verb<O> | Promise<Verb<O>>` (TS already splits the name into
   `registerVerb`, so the marker is explicit)
 - `portKV<P, O>(doc?)` — composing, verb-returning (the remaining 2×2 slot)
 
@@ -65,37 +59,31 @@ Notes and semantics:
   Writing a `portK<void, void>` implementation as `(kernel) => …`
   (fn.length 1) still binds correctly through the composition.
 - **Payloads are at most one argument; none means `void`**: the shape
-  `port<void, O>()` enforces this naturally (corresponding to the Swift
-  macro's "at most one payload parameter" check).
-- **An omitted/empty doc is a `console.warn`**: Swift's
-  `UndocumentedCallable` is *warning*-level, so the TS port also makes the
-  doc optional and warns instead of throwing. The symbol then has no
-  description (blank in the wiring graph).
+  `port<void, O>()` enforces this naturally.
+- **An omitted/empty doc is a `console.warn`**: the doc is optional, and an
+  omission warns instead of throwing. The symbol then has no description
+  (blank in the wiring graph).
 - **Cross-definition id collisions throw at mint time** (`CallableError`,
-  code `'duplicateSymbolId'`): the translation of the Swift macro plugin's
-  `SymbolIDRegistry` + compile error, using a module-global ledger (the same
+  code `'duplicateSymbolId'`), using a module-global ledger (the same
   pattern as `defineState`). Only ids minted by `defineCallable` are covered
-  — Swift's registry is also macro-only, and hand-minted `symbol(id)` is out
-  of scope (a collision there still throws `'duplicate'` at the second
-  register). The spec keys `wire` / `__spec` are reserved because they
-  collide with the generated surface (`'reservedMethodName'` throw).
+  — hand-minted `symbol(id)` is out of scope (a collision there still throws
+  `'duplicate'` at the second register). The spec keys `wire` / `__spec` are
+  reserved because they collide with the generated surface
+  (`'reservedMethodName'` throw).
 - **Excess keys are type errors (exactness)**: fresh object literals hit
   TS's excess property check; a non-fresh device (via a variable) is
   rejected by `wire`'s `D & { [excessKey]: never }` (the Exclude-`never`
   trick). No runtime throw is needed (wire only walks spec keys, so an
-  excess key is inert at runtime). Swift's `wire(_ device: any Protocol)`
-  tolerates extra members, but in TS "a typo'd method name = an excess key
-  + a missing implementation", so rejecting from both sides is safer.
+  excess key is inert at runtime). Rejecting from both sides is safer: in
+  TS, a typo'd method name shows up as both an excess key and a missing
+  implementation.
 - An inline fresh literal device gets contextual parameter typing
   (`(cells) => …` needs no annotations — inferred from the
   `CallableDevice<Spec>` constraint).
 
-Non-correspondences with `@callable`: **no automatic JSDoc extraction**
-(docs are explicit `port()` arguments); compile-time diagnostics translate
-to "throw / console.warn at module evaluation" (TS has no macro expansion
-hook); Swift's tolerance for re-expanding the same protocol (its registry
-allows a same-name re-claim) is unnecessary here, so re-minting the same
-prefix also throws.
+**No automatic JSDoc extraction**: docs are explicit `port()` arguments.
+Compile-time diagnostics translate to "throw / `console.warn` at module
+evaluation". Re-minting the same prefix also throws.
 
 ## actionsOf (redux-style dispatch — TS-only)
 

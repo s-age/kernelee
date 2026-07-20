@@ -21,7 +21,7 @@ const kernel = new KernelBuilder().build({ buffer: bufferBuilder });
 
 kernel.buffer.mutate(GridState, (g) => ({ ...g, rows: [...g.rows, row] })); // ★ copy-on-write
 kernel.buffer.read(GridState);              // current snapshot
-// read/mutate/subscribe on an unallocated key throws (Swift's precondition equivalent)
+// read/mutate/subscribe on an unallocated key throws
 
 // React: passes straight into useSyncExternalStore
 useSyncExternalStore(
@@ -30,20 +30,20 @@ useSyncExternalStore(
 );
 ```
 
-- **`mutate` is copy-on-write**: the updater **returns** a new value (unlike
-  Swift's `inout`). Don't mutate `current` in place and return it — the value
+- **`mutate` is copy-on-write**: the updater **returns** a new value.
+  Don't mutate `current` in place and return it — the value
   changes but the reference doesn't, killing React's change detection. The
   reference-change guarantee is supplied by `mutate`'s contract;
   `getSnapshot` is an alias of `read`.
-- **`mutate` is synchronous** (single-threaded, so Swift's main-actor hop is
-  unnecessary). The whole read-modify-write is one critical section. Listener
-  notification also fires synchronously inside `mutate` (1 mutate = 1 call
-  per listener). A throw inside a listener is contained (`console.error`)
-  and does not take sibling listeners down.
+- **`mutate` is synchronous** (single-threaded). The whole read-modify-write
+  is one critical section. Listener notification also fires synchronously
+  inside `mutate` (1 mutate = 1 call per listener). A throw inside a
+  listener is contained (`console.error`) and does not take sibling
+  listeners down.
 - **The default sink for dispatch failures is `KernelErrorState`**: with no
   `onError` injected, failures land in `kernel.buffer`'s `KernelErrorState`
-  cell as `"symbolId: message"` (following Swift's `defaultErrorSink`). An
-  explicitly injected `onError` wins and `KernelErrorState` is never touched.
+  cell as `"symbolId: message"`. An explicitly injected `onError` wins and
+  `KernelErrorState` is never touched.
 - **`build()` freezes the cell *set*, not the cells**: a later `allocate` on
   the builder does not appear in an already-built Buffer, but the cells
   themselves are shared — builder↔buffer and buffer↔buffer (same builder)

@@ -16,10 +16,10 @@ import type { DispatchKey } from './dispatch-key.js';
  * single boundary cast in `Kernel`'s interpreter. That is why they are erased
  * to `unknown` without losing any guarantee that ever existed.
  *
- * Swift's `Verb<Forward>` enum, translated to a discriminated union. Swift's
- * `.erased()` has no runtime counterpart here: `Verb<F>` is structurally
- * assignable to `Verb<unknown>` (only `next.value` is typed, covariantly), so
- * erasure is purely a type-level widening.
+ * A discriminated union of control-flow verbs. There is no runtime erasure
+ * step: `Verb<F>` is structurally assignable to `Verb<unknown>` (only
+ * `next.value` is typed, covariantly), so widening to `Verb<unknown>` is
+ * purely type-level.
  */
 export type Verb<F> =
   /** Continue: `F` becomes the next stage's payload. */
@@ -108,8 +108,8 @@ export function fail(error: unknown, desc?: string): Verb<never> {
  * compiles each typed stage down to one of these, so the kernel's iterative
  * stage runner needs no other vocabulary.
  *
- * (Swift counterpart: `PipeStage.run`. The `descriptor` half of `PipeStage`
- * is introspection metadata — `StageDescriptor` in this port.)
+ * (The `descriptor` half of `PipeStage` is introspection metadata — see
+ * `StageDescriptor`.)
  *
  * `parentSpan` ([[span.ts]]): the span a symbol-backed stage's
  * `kernel.invoke` call should mint its own span under. Optional and additive —
@@ -162,9 +162,8 @@ export type Diversion =
 /**
  * Package an *unchecked-tier* jump target.
  *
- * The typed shape — `diversion(pipe, payload)` — is the Swift
- * `Diversion.init(_:_:)` counterpart: the payload is checked against the
- * pipe's `Input`, the usual idiom being
+ * The typed shape — `diversion(pipe, payload)` — checks the payload against
+ * the pipe's `Input`, the usual idiom being
  * `divert(diversion(otherPipe, payload))`. The raw shape
  * (`ErasedStage[]` + payload) remains for machinery that assembles stage
  * lists by hand.

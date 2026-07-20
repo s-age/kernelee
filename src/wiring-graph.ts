@@ -4,8 +4,8 @@ import type { Pipe, StageDescriptor } from './pipe.js';
 // MARK: - PipeDescriptorEntry (one Pipe, catalogued)
 
 /**
- * One `Pipe` entered into a wiring-graph catalog — Swift's `PipeDescriptor`,
- * scoped to what a static wiring graph needs (no `inputType`, for the same reason
+ * One `Pipe` entered into a wiring-graph catalog, scoped to what a static
+ * wiring graph needs (no `inputType`, for the same reason
  * {@link StageDescriptor} omits `flows`: TS generics are erased, so there is
  * no runtime type name to record).
  */
@@ -20,12 +20,12 @@ export interface PipeDescriptorEntry {
 }
 
 /**
- * Catalog one `Pipe` — Swift's `PipeDescriptor(key:title:pipe:note:)`. There
+ * Catalog one `Pipe`. There
  * is no registry to enumerate (wiring is scattered across independently
  * constructed `Pipe`/`Callable` values, and `defineCallable` itself carries no
  * static topology — see `callable.ts`'s `mintedCallableIds`, which is a
  * collision ledger, not a readable registry): a caller builds the catalog
- * array by hand, exactly as Swift's own consumers do.
+ * array by hand.
  */
 export function describePipe(
   key: string,
@@ -75,7 +75,7 @@ export interface WiringSymbolEntry {
  */
 export type WiringGuardEntry = GuardCatalogEntry;
 
-/** The projected, JSON-serializable static wiring graph — Swift's `IndexDocument`, scoped to wiring topology. */
+/** The projected, JSON-serializable static wiring graph, scoped to wiring topology. */
 export interface WiringGraphDocument {
   /**
    * Golden-JSON contract version. Bumped 4 → 5 when `StageDescriptor` gained
@@ -135,8 +135,7 @@ export interface WiringGraphDocument {
 }
 
 /** Every stage in `stages`, plus every stage nested in a `fork`'s `branches`
- * AND its `untrackedBranches`, recursively — Swift's `flattened`/`projectStage`
- * walk. Untracked (detached) branches are folded in exactly like tracked ones:
+ * AND its `untrackedBranches`, recursively. Untracked (detached) branches are folded in exactly like tracked ones:
  * a detached branch's `symbolId`/`divertsTo` are real graph edges (a symbol it
  * invokes, a flow it diverts to), so omitting them would silently drop those
  * edges — the precise "silent absence" defect this project rejects. */
@@ -164,8 +163,8 @@ function addToSetMap<K>(map: Map<K, Set<string>>, key: K, value: string): void {
 
 /**
  * Fold a `PipeDescriptorEntry` catalog into one JSON-serializable
- * `WiringGraphDocument` — Swift's `IndexProjection`, scoped to wiring
- * topology (no bindings/git metadata, no SwiftSyntax static-scan
+ * `WiringGraphDocument`, scoped to wiring
+ * topology (no bindings/git metadata, no static-scan
  * sections). `kind` is computed purely from `Pipe.descriptors` (already on
  * each entry) and `boundSymbolIds` (already on `KernelBuilder`) — no new
  * runtime tracking.
@@ -301,8 +300,8 @@ export interface WiringGraphIssue {
  * **Documented ceiling**: a `divertsTo` string that names a *real
  * but wrong* catalog key (an author-swapped, valid-looking reference) is indistinguishable from a
  * correct one to both checks — exactly that mistake has passed both checks silently in practice.
- * No compile-time mechanism closes this either (verified
- * against swift-kernelee's own `Pipe.swift`, which has the identical, deliberate limitation).
+ * No compile-time mechanism closes this either — a divert's destination is
+ * decided at runtime, so static derivation is impossible in principle.
  *
  * **`orphanEntry` assumes the catalog is a complete enumeration of the app's real dispatch
  * surface.** A curated-subset catalog (e.g.

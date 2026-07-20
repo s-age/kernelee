@@ -8,13 +8,11 @@
  * reload can't race a create that was submitted just before it. Each work item
  * owns its own error handling — the bus only sequences.
  *
- * Swift drains an `AsyncStream` on one long-lived task; the TS translation is
- * a serial promise chain: each `enqueue` appends to `queue`, so a work item
- * starts only after its predecessor settles — even when the predecessor is
- * async, a later submission never overtakes it.
+ * The implementation is a serial promise chain: each `enqueue` appends to
+ * `queue`, so a work item starts only after its predecessor settles — even
+ * when the predecessor is async, a later submission never overtakes it.
  *
- * (Swift's DEBUG time-travel hooks — `suspendAndWaitUntilIdle` /
- * `resumeDraining` — are not ported.)
+ * (Time-travel hooks — suspend/resume draining — are not implemented.)
  */
 export class CommandBus {
   #queue: Promise<void> = Promise.resolve();

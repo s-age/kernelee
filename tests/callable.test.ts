@@ -26,9 +26,7 @@ interface Seed {
 }
 
 /**
- * One spec exercising the whole 2×2: leaf/composing × value/verb — the TS
- * counterpart of a `@callable("Compute.Life")` protocol whose methods span
- * Swift's four `register` overloads.
+ * One spec exercising the whole 2×2: leaf/composing × value/verb.
  */
 const LifePort = defineCallable('Compute.Life', {
   stepChunk: port<readonly number[], readonly number[]>('advance a row chunk one generation'),
@@ -158,8 +156,7 @@ test('wireBindsEverySpecKey', () => {
 /**
  * Two `defineCallable`s minting the same `"prefix.method"` id must throw at
  * the *second mint* (module evaluation), not silently collide in
- * `KernelBuilder` at some later wire. Swift's `SymbolIDRegistry` +
- * `DuplicateSymbolID` compile error, translated.
+ * `KernelBuilder` at some later wire.
  */
 test('duplicateIdAcrossDefineCallableThrows', () => {
   defineCallable('Collide.Widget', { fetch: port<string, number>('fetch a widget') });
@@ -196,10 +193,9 @@ test('reservedSpecKeyThrows', () => {
 // MARK: - Undocumented port warning
 
 /**
- * A missing (or blank) doc is a visible hole, warned at mint time — Swift's
- * `UndocumentedCallable` diagnostic is a *warning*, so `doc` is optional and
- * the TS translation warns rather than throws. The symbol then carries no
- * description.
+ * A missing (or blank) doc is a visible hole, warned at mint time — `doc`
+ * is optional, and an omission warns rather than throws. The symbol then
+ * carries no description.
  */
 test('missingDocWarnsAtDefineCallable', () => {
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

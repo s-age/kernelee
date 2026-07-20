@@ -9,10 +9,10 @@ import type { CallableSpec, Port } from './callable.js';
  * the payload rides alongside, and `Kernel.dispatch(action)` is the store's
  * `dispatch`.
  *
- * This is a TS-only convenience with no Swift counterpart: it adds no new
- * capability over `dispatch(sym, payload)` — it only lets a call site *build*
- * the command where the intent lives and *fire* it somewhere else (an event
- * handler holding one generic dispatcher). Both halves stay plain data, which
+ * This adds no new capability over `dispatch(sym, payload)` — it only lets
+ * a call site *build* the command where the intent lives and *fire* it
+ * somewhere else (an event handler holding one generic dispatcher). Both
+ * halves stay plain data, which
  * is the whole architecture ("control is data"): an action is inert until it
  * meets a kernel, so it can be constructed, passed around, logged, or asserted
  * on in tests without touching the mesh.

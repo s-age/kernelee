@@ -1,10 +1,8 @@
 # kernelee
 
 A **UNIX-pipe-like, message-driven, forward-only** control framework for
-TypeScript. Control is data (messages), not a call hierarchy. A port of
-[swift-kernelee](https://github.com/s-age/swift-kernelee) — the Swift
-implementation's semantics are the source of truth, translated into TS
-idioms. Zero runtime dependencies, ESM, strict.
+TypeScript. Control is data (messages), not a call hierarchy. Zero runtime
+dependencies, ESM, strict.
 
 See it in action:
 [kernelee-lifegame](https://github.com/s-age/kernelee-lifegame) — Conway's
@@ -126,7 +124,7 @@ Design notes and full API semantics live in `docs/`:
 
 - [Pipes & fork](docs/pipes-and-fork.md) — `pipeline` / `divert` (O(1)
   loops) / `tap` / `map` / `effect`, and parallel fan-out with fork
-  (including how cancellation differs from Swift).
+  (including fail-fast cancellation semantics).
 - [Buffer](docs/buffer.md) — observable state cells (`defineState` /
   `mutate` / `subscribe`), `useSyncExternalStore` fit, `KernelErrorState`.
 - [defineCallable & actionsOf](docs/define-callable.md) — the typed port
@@ -139,12 +137,9 @@ Design notes and full API semantics live in `docs/`:
   the app's wiring.
 - [Transport adapters](docs/transport-adapters.md) — why the core ships no
   delivery layer, and the two APIs a bridge package builds on.
-- [Swift ↔ TS correspondence](docs/swift-ts-correspondence.md) — the full
-  port table, including every deliberate non-correspondence.
 
-Not ported *yet*: time-travel (trace forest reconstruction,
-`Buffer.capture` / `restore`) — swift-kernelee ships it, and the TS port
-plans to build it on `TraceState`. Today,
+Not implemented *yet*: time-travel (trace forest reconstruction,
+`Buffer.capture` / `restore`) — planned, built on `TraceState`. Today,
 [kernelee-devtools-bridge](https://github.com/s-age/kernelee-devtools-bridge)
 already rides a `Buffer` snapshot on every traced message, so the state at
 any past point is inspectable; what's missing is restoring the live app to

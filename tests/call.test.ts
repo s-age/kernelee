@@ -25,7 +25,7 @@ const shortCircuit = symbol<number, number>('test.shortCircuit');
 
 class Boom extends Error {}
 
-/** Build a kernel wired with the leaf fixtures — the Swift `makeKernel()` idiom. */
+/** Build a kernel wired with the leaf fixtures. */
 function makeKernel(): Kernel {
   const builder = new KernelBuilder();
   builder.register(increment, (n) => n + 1);
@@ -78,7 +78,7 @@ test('verbReturningHandlerIsInterpretedByCall', async () => {
 });
 
 /**
- * Swift `interpret` returns an `abort`'s value through the same boundary as
+ * `interpret` returns an `abort`'s value through the same boundary as
  * `next` — via `call`, a normal early termination is indistinguishable from a
  * completed run.
  */
@@ -88,7 +88,7 @@ test('abortAtCallYieldsItsValueAsTheResult', async () => {
   expect(await kernel.call(shortCircuit, 0)).toBe(-1); // abort(-1) is the result
 });
 
-// MARK: - divert at call (Swift interpret: run the diverted-to stages, iteratively)
+// MARK: - divert at call (interpret: run the diverted-to stages, iteratively)
 
 test('divertAtCallRunsTheDivertedStagesAndReturnsTheirResult', async () => {
   const addOne: ErasedStage = (_kernel, value) => next((value as number) + 1);

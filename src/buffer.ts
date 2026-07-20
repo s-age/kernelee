@@ -5,17 +5,16 @@ export type BufferErrorCode = 'duplicateStateId' | 'duplicateAllocate' | 'unallo
 /**
  * The buffer's own failure vocabulary. All three codes mark a *wiring-time
  * programming error*, never a runtime input — the same policy as
- * `KernelError` (Swift traps these with `precondition`; TS has no
- * process-trapping precondition, so the same programming error surfaces as an
- * immediate throw where the stack names the offender):
+ * `KernelError` (TS has no process-trapping precondition, so the same class
+ * of programming error surfaces as an immediate throw where the stack names
+ * the offender):
  *
- * - `'duplicateStateId'` — two `defineState` calls minted the same id. Swift
- *   keys stores by the state *type* (`ObjectIdentifier`), which the compiler
- *   keeps unique for free; TS erases types, so uniqueness of the explicit
- *   token id is enforced at mint time instead.
+ * - `'duplicateStateId'` — two `defineState` calls minted the same id. TS
+ *   erases types at runtime, so uniqueness of the explicit token id is
+ *   enforced at mint time instead of being derived from the state's type.
  * - `'duplicateAllocate'` — a second `allocate` for an already-allocated key.
  * - `'unallocated'` — `read`/`mutate`/`subscribe` on a key that was never
- *   allocated (Swift: `preconditionFailure("Buffer store … was not allocated")`).
+ *   allocated.
  */
 export class BufferError extends Error {
   override readonly name = 'BufferError';
@@ -33,16 +32,15 @@ export class BufferError extends Error {
 // MARK: - StateKey
 
 /**
- * The name of one buffer cell: a typed token standing in for Swift's
- * "the state *type* is the key" (`ObjectIdentifier(State.self)`). TS erases
- * types at runtime, so the key must be an explicit value — `id` is the
- * runtime identity, and the phantom pins `S` so `read`/`mutate` on this key
- * are typed end to end.
+ * The name of one buffer cell: a typed token that stands in for the state's
+ * type as its key. TS erases types at runtime, so the key must be an
+ * explicit value — `id` is the runtime identity, and the phantom pins `S` so
+ * `read`/`mutate` on this key are typed end to end.
  *
- * `initial` travels with the key (Swift passes the seed value to `allocate`
- * instead): the definition site — the module that owns the state shape — is
- * the one place that knows a correct empty value, so the key carries it and
- * every `allocate`/`allocateIfAbsent` of the same key agrees on the seed.
+ * `initial` travels with the key: the definition site — the module that
+ * owns the state shape — is the one place that knows a correct empty value,
+ * so the key carries it and every `allocate`/`allocateIfAbsent` of the same
+ * key agrees on the seed.
  */
 export interface StateKey<S> {
   readonly id: string;
@@ -61,8 +59,7 @@ const mintedIds = new Set<string>();
 
 /**
  * Mint a state key. One `defineState` per state shape, at module scope, in
- * the module that owns the shape — the TS translation of "declare a state
- * struct" in Swift, where the type declaration itself is the key.
+ * the module that owns the shape.
  *
  * A duplicate id throws immediately (code `'duplicateStateId'`): two keys
  * sharing an id would silently alias one cell, and the mint site is where
@@ -90,9 +87,9 @@ export function defineState<S>(id: string, initial: S): StateKey<S> {
  * the cell entirely). Clearing is the app's job, through its normal write
  * path: the displaying view dispatches an app-declared clear command, and
  * the layer that holds the kernel `mutate`s the cell back to
- * `{ message: null }` — a sink only ever writes here, it never clears. Swift
- * models the same thing as `message: String?`; TS spells the "explicitly
- * empty" case `null` so a plain object literal can express it.
+ * `{ message: null }` — a sink only ever writes here, it never clears. TS
+ * spells the "explicitly empty" case `null` so a plain object literal can
+ * express it.
  */
 export interface KernelErrorValue {
   readonly message: string | null;
@@ -118,9 +115,8 @@ export const KernelErrorState: StateKey<KernelErrorValue> = defineState<KernelEr
 
 /**
  * One *named container* in the buffer: the current value of a single state
- * key plus its change listeners. Swift's `BufferStore<State>` — there, the
- * Observation macro supplies the listener half; here it is an explicit `Set`
- * that `subscribe` fills and `mutate` fires.
+ * key plus its change listeners, an explicit `Set` that `subscribe` fills
+ * and `mutate` fires.
  */
 interface Cell {
   value: unknown;
@@ -151,10 +147,8 @@ export class BufferBuilder {
    * Allocate a named container, seeded with the key's `initial`. A duplicate
    * allocate throws (code `'duplicateAllocate'`): which seed a cell starts
    * from is part of the wiring, and a silent last-write-win would hide a
-   * double-wired state. (Swift's `allocate` silently overwrites — but there
-   * the caller passes the seed value, so a second allocate is at least a
-   * visible choice; here the seed rides on the key, so a second allocate can
-   * only be a mistake.)
+   * double-wired state. (The seed rides on the key here, so a second
+   * allocate can only be a mistake.)
    */
   allocate<S>(key: StateKey<S>): void {
     if (this.#cells.has(key.id)) {
@@ -182,8 +176,7 @@ export class BufferBuilder {
    * Freeze the container *set* into a `Buffer`, after seeding the
    * framework-owned default: `KernelErrorState`, the target of the default
    * error sink — a release feature, so unconditional. Callers allocate only
-   * their own app states. (Swift's `build()` also seeds the DEBUG monitor
-   * states; the TS counterpart, `TraceState`, is allocated by
+   * their own app states. (`TraceState` is allocated by
    * `KernelBuilder.build`, and only when tracing is on.)
    *
    * A later `allocate` on the builder is invisible to an already-built
@@ -208,11 +201,9 @@ export class BufferBuilder {
  * pure-logic layer**, never in here: a cell stores whatever the updater
  * returns, and validating/deriving that value is not its job.
  *
- * Swift's `Buffer` is `@MainActor` because SwiftUI observes synchronously and
- * the dispatch core runs off the main actor; single-threaded JS needs no hop,
- * so `mutate` is plain synchronous — the whole read-modify-write is one job,
- * which is the same "no lost update between read and write" guarantee the
- * main-actor critical section gives Swift.
+ * JS is single-threaded, so `mutate` needs no actor hop — it is plain
+ * synchronous, and the whole read-modify-write is one job, giving a "no
+ * lost update between read and write" guarantee.
  */
 export class Buffer {
   readonly #cells: ReadonlyMap<string, Cell>;
@@ -260,10 +251,9 @@ export class Buffer {
 
   /**
    * Atomically read-modify-write a cell: the updater receives the current
-   * value and **returns the next one** (copy-on-write — Swift's `mutate`
-   * mutates `inout` in place; immutable-update is the JS idiom, and it is
-   * what keeps `getSnapshot` returning a fresh reference per change, which
-   * React's change detection relies on). Do not mutate `current` in place
+   * value and **returns the next one** (copy-on-write — the JS idiom, and
+   * it is what keeps `getSnapshot` returning a fresh reference per change,
+   * which React's change detection relies on). Do not mutate `current` in place
    * and return it — the value would change but its reference would not.
    *
    * Synchronous and single-threaded, so the whole read-modify-write is one

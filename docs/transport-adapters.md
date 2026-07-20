@@ -3,10 +3,8 @@
 The package's "zero runtime dependencies, ESM, strict" claim rests on
 `package.json`'s `devDependencies` being only
 `@types/node`/`typescript`/`vitest`. Bringing a delivery mechanism such as a
-WebSocket client into the core package would break that. Swift achieves the
-separation by putting `KernelDebugUI` in a separate target from `Kernel`
-(`Package.swift`, with `#if DEBUG` gates); the TS port keeps the delivery
-layer outside the core in the same shape.
+WebSocket client into the core package would break that, so the delivery
+layer stays outside the core, in a separate package.
 
 **There is no `TransportAdapter` type.** `onTrace` (`src/trace.ts`) and
 `describePipe`/`projectWiringGraph` (`src/wiring-graph.ts`) are public
