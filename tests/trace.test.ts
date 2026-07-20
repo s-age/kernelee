@@ -1,5 +1,6 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import {
+  abort,
   BufferError,
   KernelBuilder,
   fail,
@@ -9,6 +10,17 @@ import {
   type TraceSink,
 } from '../src/index.js';
 import { appendTraceEntry, describeTracePayload, type TraceStateValue } from '../src/trace.js';
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Poll until `condition` holds, bounded so a stuck bus fails instead of hanging. */
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 1000; i += 1) {
+    if (condition()) return;
+    await sleep(1);
+  }
+  throw new Error('condition never held');
+}
 
 // MARK: - appendTraceEntry (pure data model)
 
@@ -192,4 +204,176 @@ test('an explicit fail(...) verb is recorded as "fail" too, same as a thrown err
   const { entries } = kernel.buffer.read(TraceState);
   expect(entries).toHaveLength(1);
   expect(entries[0]?.verb).toBe('fail');
+});
+
+// MARK: - onTrace containment: observation never changes program behavior
+
+test('a sink that throws is contained per-call, not latched: the call still resolves, and the next call is traced normally', async () => {
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    let calls = 0;
+    const seen: string[] = [];
+    const onTrace: TraceSink = (symbolId) => {
+      calls += 1;
+      if (calls === 1) throw new Error('sink boom');
+      seen.push(symbolId);
+    };
+    const builder = new KernelBuilder();
+    builder.register(echo, (n: number) => n);
+    const kernel = builder.build({ tracing: true, onTrace });
+
+    await expect(kernel.call(echo, 1)).resolves.toBe(1); // resolves, not rejected, despite the sink throwing
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+
+    await expect(kernel.call(echo, 2)).resolves.toBe(2); // containment is per-call, not a one-shot latch
+    expect(seen).toEqual([echo.id]);
+  } finally {
+    errorSpy.mockRestore();
+  }
+});
+
+test('a sink that throws does not mask the handler\'s own thrown error', async () => {
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const onTrace: TraceSink = () => {
+      throw new Error('sink boom');
+    };
+    const builder = new KernelBuilder();
+    builder.register(boom, () => {
+      throw new Error('kaboom');
+    });
+    const kernel = builder.build({ tracing: true, onTrace });
+
+    await expect(kernel.call(boom, 1)).rejects.toThrow('kaboom'); // the handler's error, never the sink's
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+  } finally {
+    errorSpy.mockRestore();
+  }
+});
+
+test('a sink that throws does not phantom-fail a successful dispatch — the injected error sink is never called', async () => {
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const errors: string[] = [];
+    const onTrace: TraceSink = () => {
+      throw new Error('sink boom');
+    };
+    const ok = symbol<number, void>('trace.dispatchOk');
+    const builder = new KernelBuilder();
+    builder.register(ok, () => {});
+    const kernel = builder.build({
+      tracing: true,
+      onTrace,
+      onError: (symbolId, error) => {
+        errors.push(`${symbolId}:${(error as Error).message}`);
+      },
+    });
+
+    kernel.dispatch(ok, 1);
+    await until(() => errorSpy.mock.calls.length >= 1); // wait for the sink's containment to have run
+    expect(errors).toHaveLength(0); // no phantom failure reached the error sink
+  } finally {
+    errorSpy.mockRestore();
+  }
+});
+
+const evilPayload = {
+  toJSON(): never {
+    throw new Error('boom-json');
+  },
+  toString(): never {
+    throw new Error('boom-string');
+  },
+};
+
+test('a payload that defeats both rendering tiers degrades to <unrenderable> rather than dropping the entry', async () => {
+  const passthrough = symbol<unknown, unknown>('trace.evilPayload');
+  const builder = new KernelBuilder();
+  builder.register(passthrough, (p: unknown) => p);
+  const kernel = builder.build({ tracing: true });
+
+  await expect(kernel.call(passthrough, evilPayload)).resolves.toBe(evilPayload);
+
+  const { entries } = kernel.buffer.read(TraceState);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.verb).toBe('next');
+  expect(entries[0]?.payload).toBe('<unrenderable>');
+});
+
+test('a payload that defeats both rendering tiers still records the "fail" entry, with <unrenderable> payload', async () => {
+  const boomEvil = symbol<unknown, void>('trace.boomEvilPayload');
+  const builder = new KernelBuilder();
+  builder.register(boomEvil, () => {
+    throw new Error('kaboom');
+  });
+  const kernel = builder.build({ tracing: true });
+
+  await expect(kernel.call(boomEvil, evilPayload)).rejects.toThrow('kaboom');
+
+  const { entries } = kernel.buffer.read(TraceState);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.verb).toBe('fail');
+  expect(entries[0]?.payload).toBe('<unrenderable>');
+});
+
+// MARK: - abort/fail desc surfaces on the trace entry (additive)
+
+const abortWithDesc = symbol<number, number>('trace.abortWithDesc');
+const abortWithoutDesc = symbol<number, number>('trace.abortWithoutDesc');
+const failWithDesc = symbol<number, number>('trace.failWithDesc');
+
+test('an abort(value, desc) verb is recorded with its desc on the trace entry', async () => {
+  const builder = new KernelBuilder();
+  builder.registerVerb(abortWithDesc, () => abort(-1, 'guard tripped'));
+  const kernel = builder.build({ tracing: true });
+
+  await expect(kernel.call(abortWithDesc, 1)).resolves.toBe(-1);
+
+  const { entries } = kernel.buffer.read(TraceState);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.verb).toBe('abort');
+  expect(entries[0]?.desc).toBe('guard tripped');
+});
+
+test('an abort(value) verb with no desc leaves the desc property absent on the trace entry', async () => {
+  const builder = new KernelBuilder();
+  builder.registerVerb(abortWithoutDesc, () => abort(-1));
+  const kernel = builder.build({ tracing: true });
+
+  await expect(kernel.call(abortWithoutDesc, 1)).resolves.toBe(-1);
+
+  const { entries } = kernel.buffer.read(TraceState);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.verb).toBe('abort');
+  expect(entries[0]?.desc).toBeUndefined();
+  expect('desc' in entries[0]!).toBe(false);
+});
+
+test('a fail(error, desc) verb is recorded with its desc on the trace entry', async () => {
+  const builder = new KernelBuilder();
+  builder.registerVerb(failWithDesc, () => fail(new Error('kaboom'), 'validation failed'));
+  const kernel = builder.build({ tracing: true });
+
+  await expect(kernel.call(failWithDesc, 1)).rejects.toThrow('kaboom');
+
+  const { entries } = kernel.buffer.read(TraceState);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.verb).toBe('fail');
+  expect(entries[0]?.desc).toBe('validation failed');
+});
+
+test('a thrown error (not an explicit fail(...)) still records with no desc', async () => {
+  const boomNoDesc = symbol<number, number>('trace.boomNoDesc');
+  const builder = new KernelBuilder();
+  builder.register(boomNoDesc, () => {
+    throw new Error('kaboom');
+  });
+  const kernel = builder.build({ tracing: true });
+
+  await expect(kernel.call(boomNoDesc, 1)).rejects.toThrow('kaboom');
+
+  const { entries } = kernel.buffer.read(TraceState);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.desc).toBeUndefined();
+  expect('desc' in entries[0]!).toBe(false);
 });

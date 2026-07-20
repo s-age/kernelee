@@ -86,6 +86,18 @@ await kernel.call(increment, 41); // => 42 (typed)
 kernel.dispatch(reload, undefined); // fire-and-forget, serialized in submission order, failures go to onError
 ```
 
+With no `onError` injected, failures land in `KernelErrorState` — the sink
+only ever writes there, it never clears. Clearing is one app-declared
+command plus a handler that mutates the cell back to `null`:
+
+```ts
+const clearError = symbol<void, void>('errors.clear');
+builder.register(clearError, (kernel: Kernel, _: void) => {
+  kernel.buffer.mutate(KernelErrorState, () => ({ message: null }));
+});
+// view: dispatch(clearError) on whatever affordance dismisses the banner
+```
+
 Multi-step flows chain like a UNIX pipe and freeze into a typed value:
 
 ```ts

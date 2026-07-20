@@ -18,6 +18,14 @@ export type TraceVerbKind = Verb<unknown>['kind'];
  * `(span, parent)` pair into one argument) — assigning the monotonic `id`
  * that lands in a `TraceEntry` is `appendTraceEntry`'s job alone, done only
  * once a sink chooses to record into {@link TraceState}.
+ *
+ * A sink must be **synchronous and must not throw**. If it throws, `Kernel.invoke`
+ * contains the error, reports it via `console.error`, and drops that entry —
+ * the sink's failure never changes the outcome of the `call`/`dispatch` being
+ * traced. If an `async` function is assigned here (it type-checks, since an
+ * `async () => {}` is assignable to `=> void`), the `Promise` it returns is
+ * **not** covered by that containment: a rejection surfaces as an unhandled
+ * rejection. A sink that does async work must catch its own errors.
  */
 export type TraceSink = (
   symbolId: string,
@@ -25,6 +33,13 @@ export type TraceSink = (
   span: Span,
   payload: string | undefined,
   timestamp: number,
+  /**
+   * The resolved verb's own `desc`, when the handler returned an
+   * `abort(value, desc)` / `fail(error, desc)` — additive: a sink written
+   * before this parameter existed still type-checks and still runs
+   * unchanged (it simply never reads its sixth argument).
+   */
+  desc?: string,
 ) => void;
 
 /** One recorded `Kernel.invoke` pass, as stored in {@link TraceState}. */
@@ -34,9 +49,22 @@ export interface TraceEntry {
   readonly symbolId: string;
   readonly verb: TraceVerbKind;
   readonly span: Span;
-  /** Rendered by {@link describeTracePayload}; absent for a `void` payload. */
+  /**
+   * Rendered by {@link describeTracePayload}; absent for a `void` payload.
+   * Degrades to the literal `'<unrenderable>'` if the payload defeats both of
+   * that function's rendering tiers (see `Kernel.#notifyTrace`).
+   */
   readonly payload?: string;
   readonly timestamp: number;
+  /**
+   * The resolved verb's own human-readable reason, carried over verbatim
+   * from `abort(value, desc)` / `fail(error, desc)` (see `verb.ts`).
+   * Additive and optional: absent whenever the resolved verb had no `desc`
+   * (a `next`/`divert`, or an `abort`/`fail` called without one) — never
+   * present with an `undefined` value, so existing readers that never knew
+   * this field could exist see no shape change at all.
+   */
+  readonly desc?: string;
 }
 
 // MARK: - TraceState
@@ -123,6 +151,10 @@ function summarizeBinaryViews(_key: string, value: unknown): unknown {
  * O(1) `"Uint8Array(3072)"`-style summary, at any nesting depth — see
  * {@link summarizeBinaryViews} for why per-element rendering is both a
  * measured hot-path cost and less informative than the summary.
+ *
+ * On the rare payload where both tiers throw, the caller (`Kernel.#notifyTrace`)
+ * catches it and degrades the entry's `payload` to the fixed string
+ * `'<unrenderable>'` rather than dropping the entry.
  */
 export function describeTracePayload(payload: unknown): string | undefined {
   if (payload === undefined) {

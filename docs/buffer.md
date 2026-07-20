@@ -44,3 +44,8 @@ useSyncExternalStore(
   `onError` injected, failures land in `kernel.buffer`'s `KernelErrorState`
   cell as `"symbolId: message"` (following Swift's `defaultErrorSink`). An
   explicitly injected `onError` wins and `KernelErrorState` is never touched.
+- **`build()` freezes the cell *set*, not the cells**: a later `allocate` on
+  the builder does not appear in an already-built Buffer, but the cells
+  themselves are shared — builder↔buffer and buffer↔buffer (same builder)
+  share values and listeners. One `BufferBuilder` per kernel; it is not a
+  cross-kernel state-sharing mechanism.

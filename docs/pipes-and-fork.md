@@ -45,6 +45,15 @@ toDto.descriptors;                            // static shape readable without r
 
 ## fork
 
+`fork` has two vocabularies — **static `fork(branches)`** (a fixed set of
+distinct sub-pipes, decided at pipe-construction time) and **dynamic
+`fork(symbol)`** (the same one symbol, fanned over a runtime-sized list).
+They share only the name and the join strategy (`Promise.all`,
+order-preserving, fail-fast); everything else — what the operand *is*, what
+the `StageDescriptor` records, how many times a thing runs — differs.
+
+### Static: `fork(branches)`
+
 Fan the current value out to N independent branches (each a sealed sub-pipe —
 passing a builder works as sugar), run them concurrently, and collect
 **order-preserved** results. Two shapes: heterogeneous tuples (2–4 arguments,
@@ -59,7 +68,7 @@ const summary = pipeline(fetchOrder)
   .seal();
 
 const all = pipeline(fetchIds)
-  .fork([pipeline(fetchOne).seal(), pipeline(fetchOne).seal()], runtimeArity) // R[]
+  .fork([pipeline(fetchOne).seal(), pipeline(fetchOne).seal()]) // R[]
   .seal();
 ```
 
@@ -81,9 +90,67 @@ background** and their results (or later rejections) are discarded (the
 *resources* differ). Write branches so that a wasted full run is safe.
 `AbortSignal` support is future scope.
 
-Static shape: a fork stage's `StageDescriptor` has `kind: 'fork(branches)'`,
-`branches` (each branch's own descriptors) and `branchArity`
-(`fixedArity(n)` — structurally fixed, the default; `runtimeArity` — a
-definition-side declaration that the array is sized per call). On non-fork
-stages both fields are `undefined` (Swift defaults `branches` to an empty
-array; the TS port represents absence, consistent with `branchArity`).
+Static shape: a fork stage's `StageDescriptor` has `kind: 'fork(branches)'`
+and `branches` (each branch's own descriptors, in fork order). On non-fork
+stages `branches` is `undefined` (Swift defaults it to an empty array; the TS
+port represents absence). There used to also be a `branchArity` field
+(`fixedArity(n)` / `runtimeArity`, declaring whether the branch count was
+structural or sized per invocation) — removed once `fork(symbol)` (below)
+gave the "sized per invocation" case a real, non-workaround vocabulary of its
+own; see that section.
+
+**Branch/meta contract**: a leading `meta` is recognized by *positively*
+validating its shape — it must be a plain `{ note?: string }` object (a
+prototype chain that bottoms out at `Object.prototype`/`null` immediately) —
+not by guessing "doesn't look like a branch, so it must be meta". Every
+branch position accepts only a `Pipe`/`PipeBuilder` constructed by *this*
+kernelee module instance; anything else (a cross-copy `Pipe`/`PipeBuilder`
+from a duplicated kernelee install, a hand-rolled object with a `.seal`
+method, `null`/`undefined`) is rejected loudly with a diagnostic `TypeError`,
+never silently absorbed as meta and never silently duck-typed through.
+Residual gap, inherent to the overload shape: a *plain-object* branch-like
+value in the leading position (e.g. `{ stages: [] }`) is structurally
+indistinguishable from an empty meta `{}` and is still accepted as meta —
+branch validation only happens once the leading-meta slot has been decided.
+
+### Dynamic: `fork(symbol)`
+
+Fan a **runtime-sized** `ReadonlyArray<P>` cursor out to the *same* symbol,
+once per element, via `kernel.invoke` — the identical chokepoint `.pipe(sym)`
+itself uses, so gate application and invoke count are unchanged from N
+sequential `.pipe(sym)` stages, just concurrent. Order-preserving, fail-fast —
+the same join semantics as static `fork` above (each element's `abort` fills
+that element's own slot; a `divert` resolves to its target's own result; any
+`fail` rejects the whole fork).
+
+```ts
+const doubled = pipeline(fetchIds)     // KernelSymbol<void, number[]>
+  .fork(doubleOne)                     // KernelSymbol<number, number> — same symbol, N times
+  .seal();                             // Pipe<void, number[]>
+```
+
+**N ≥ 1 is a runtime contract, not a drawing convention.** An empty payload
+array throws `KernelError('emptyFanOut', symbolId, …)` rather than resolving
+to `[]`: this stage's `R[]` output can only be produced by the symbol
+actually running, so completing on zero elements would fabricate a "ran and
+produced nothing" result without the symbol ever having been invoked — the
+same class of failure `#resolveFlowKey`'s unbound-divert-key throw already
+uses this vocabulary for.
+
+Static shape: `kind: 'fork(symbol)'`, `symbolId` (the fanned-out symbol's
+id), `note` (the symbol's own `description`, same convention as
+`pipe(symbol)`/`tap(symbol)`). `branches`/`untrackedBranches` never apply —
+"how many times" is exactly what this `kind` itself declares, so there is no
+branch array to size or nest.
+
+**First exception to "a fork-family operand is a `Pipe`/`PipeBuilder`, never
+anything else."** Every shape above, and the detached-launch sugar `.spawn`
+(deliberately pipe-only — see that method's own doc comment: "never a bare
+closure or symbol"), held to that rule without exception until now —
+`fork(symbol)` is the one place a fork-family method accepts something else
+(a `KernelSymbol`) as its operand, because there is no sub-pipe to build: the
+"branch" *is* the symbol, invoked directly. `.spawn` itself is unchanged and
+remains pipe-only; this exception is scoped to `.fork` alone.
+
+Initial version is **tracked only** — there is no untracked/`.spawn` twin of
+`fork(symbol)` yet; add one only once a real caller needs it.

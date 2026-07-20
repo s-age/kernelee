@@ -19,6 +19,8 @@ import {
  */
 const CounterState = defineState('test.CounterState', { n: 0 });
 const GridState = defineState<{ rows: number[] }>('test.GridState', { rows: [] });
+const SharedCounterState = defineState('test.buffer.SharedCounterState', { n: 0 });
+const LateState = defineState('test.buffer.LateState', { n: 0 });
 
 class Boom extends Error {}
 const boom = symbol<number, void>('test.buffer.boom');
@@ -72,6 +74,40 @@ test('allocateIfAbsentDoesNotOverrideAnExplicitAllocate', () => {
   builder.allocateIfAbsent(CounterState); // must be a no-op — the cell is present
   const rebuilt = builder.build();
   expect(rebuilt.read(CounterState).n).toBe(41); // a replaced cell would read the seed (0)
+});
+
+test('buffersBuiltTwiceFromOneBuilderShareValuesAndListeners', () => {
+  // Characterization, not invitation: build() freezes the cell *set*; the
+  // cells themselves are shared, so sibling builds see each other's values
+  // and listeners. The value half is already relied on by
+  // allocateIfAbsentDoesNotOverrideAnExplicitAllocate above; the listener
+  // half is pinned here. This documents current behavior — one builder per
+  // kernel remains the contract (see BufferBuilder's doc).
+  const builder = new BufferBuilder();
+  builder.allocate(SharedCounterState);
+  const a = builder.build();
+  const b = builder.build();
+
+  let notified = 0;
+  b.subscribe(SharedCounterState, () => {
+    notified += 1;
+  });
+  a.mutate(SharedCounterState, () => ({ n: 7 }));
+
+  expect(b.read(SharedCounterState).n).toBe(7); // value shared (overlaps 67-75, kept for one coherent picture)
+  expect(notified).toBe(1); // listeners shared — the newly pinned half
+});
+
+test('buildFreezesTheCellSetNotTheCells', () => {
+  // The half "freeze" *does* promise: a later allocate on the builder is
+  // invisible to an already-built Buffer.
+  const builder = new BufferBuilder();
+  const early = builder.build();
+  builder.allocate(LateState);
+  const late = builder.build();
+
+  expect(() => early.read(LateState)).toThrowError(BufferError); // 'unallocated'
+  expect(late.read(LateState).n).toBe(0);
 });
 
 test('duplicateAllocateThrows', () => {

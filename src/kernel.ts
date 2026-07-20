@@ -6,26 +6,29 @@ import { next, type ErasedStage, type Verb } from './verb.js';
 import { mintSpan, type Span } from './span.js';
 import { CommandBus } from './command-bus.js';
 import { Buffer, BufferBuilder, KernelErrorState } from './buffer.js';
-import { appendTraceEntry, describeTracePayload, TraceState, type TraceSink } from './trace.js';
+import { appendTraceEntry, describeTracePayload, TraceState, type TraceSink, type TraceVerbKind } from './trace.js';
 import { describePipe, type PipeDescriptorEntry } from './wiring-graph.js';
 import type { GateRef, GuardCatalogEntry } from './gate.js';
 
 // MARK: - KernelError
 
-export type KernelErrorCode = 'unbound' | 'duplicate';
+export type KernelErrorCode = 'unbound' | 'duplicate' | 'emptyFanOut';
 
 /**
  * The kernel's own failure vocabulary — part of the public contract.
  *
  * `call` rejects with whatever the bound handler threw, passing through
- * untouched; these codes are the only failures the *kernel itself* produces,
- * and both mark a wiring-time programming error rather than a runtime input:
- * catch them to distinguish "the machinery is miswired" from "the operation
- * failed". Each code covers both of the kernel's name→entity tables — the
- * handler table (`KernelSymbol.id` → handler, written by `register`) and the
- * flow table (`DispatchKey.key` → pipe stages, written by `flow`) — because
- * the two tables share one failure shape: a name with no binding, or a name
- * bound twice.
+ * untouched; these codes are the only failures the *kernel/pipe machinery
+ * itself* produces (as opposed to a bound handler's own failure) — catch
+ * them to distinguish "the machinery caught a programming/contract error"
+ * from "the operation failed". `'unbound'`/`'duplicate'` cover the kernel's
+ * two name→entity tables — the handler table (`KernelSymbol.id` → handler,
+ * written by `register`) and the flow table (`DispatchKey.key` → pipe
+ * stages, written by `flow`) — because the two tables share one failure
+ * shape: a name with no binding, or a name bound twice. `'emptyFanOut'` is a
+ * different class: not a table lookup, but a runtime data contract a
+ * `fork(symbol)` stage enforces on the value flowing through it (see
+ * `PipeBuilder.fork`'s `fork(symbol)` overload in `pipe.ts`).
  *
  * - `'unbound'` — no binding was wired for the name: no handler for a symbol
  *   id at `invoke` (a forgotten `register` — mirrors Swift
@@ -37,6 +40,12 @@ export type KernelErrorCode = 'unbound' | 'duplicate';
  *   Swift traps the symbol case with a `precondition`; TS has no
  *   process-trapping precondition, so the same programming error surfaces as
  *   an immediate throw at the second bind.
+ * - `'emptyFanOut'` — a `fork(symbol)` stage received an empty payload
+ *   array. `fork(symbol)`'s `R[]` output can only be produced by actually
+ *   running the symbol once per element; resolving `[]` for a zero-length
+ *   input would fabricate a "the symbol ran over zero elements" result
+ *   without the symbol ever running, so this throws instead — `symbolId` is
+ *   the fanned-out symbol's id.
  *
  * Swift's `composeTypeMismatch` has no counterpart here: TS generics are
  * fully erased, so the terminator boundary cast is unchecked (see
@@ -112,6 +121,11 @@ export interface KernelBuildOptions {
    * the first call's `allocateIfAbsent` forward into the second (there is no
    * `deallocate`), so don't share one across kernels with different tracing
    * settings.
+   *
+   * Don't share one `BufferBuilder` across two `build()` calls at all: beyond
+   * the `allocateIfAbsent` leak above, the built buffers share their cells —
+   * state values and `subscribe` listeners flow between the two kernels (see
+   * `BufferBuilder.build()`). One builder per kernel.
    */
   buffer?: BufferBuilder;
   /**
@@ -647,9 +661,13 @@ export class KernelBuilder {
    * to `cap`.
    */
   static #defaultTraceSink(buffer: Buffer, cap: number): TraceSink {
-    return (symbolId, verb, span, payload, timestamp) => {
+    return (symbolId, verb, span, payload, timestamp, desc) => {
       buffer.mutate(TraceState, (state) =>
-        appendTraceEntry(state, { symbolId, verb, span, payload, timestamp }, cap),
+        appendTraceEntry(
+          state,
+          desc === undefined ? { symbolId, verb, span, payload, timestamp } : { symbolId, verb, span, payload, timestamp, desc },
+          cap,
+        ),
       );
     };
   }
@@ -924,6 +942,17 @@ export class Kernel {
    * directly), so without this, every failure from a `register`-bound
    * handler would be invisible to the trace, defeating the point of a
    * devtools trace.
+   *
+   * The trace notification itself never affects this method's outcome:
+   * `#notifyTrace` runs the success path outside the handler's own `try`
+   * (so a throwing sink cannot turn a resolved `call` into a rejection),
+   * and the `catch` branch re-throws the handler's own `error` unconditionally
+   * (so a throwing sink there cannot mask it either). A sink that throws is
+   * contained and reported via `console.error`; that trace entry is dropped.
+   * A payload that neither `describeTracePayload` tier can render degrades to
+   * the literal `'<unrenderable>'` instead — the entry itself is kept, since
+   * rendering failure is a property of the payload, not of the sink. See
+   * `#notifyTrace` for the mechanics.
    */
   async invoke(id: string, payload: unknown, parentSpan?: Span): Promise<Verb<unknown>> {
     const handler = this.#handlers.get(id);
@@ -938,13 +967,56 @@ export class Kernel {
     // when tracing is off: spans are unobservable then, and the root kernel
     // behaves identically in every other respect.
     const kernel = this.#onTrace === undefined ? this : this.#scoped(span);
+    let verb: Verb<unknown>;
     try {
-      const verb = await handler(kernel, payload);
-      this.#onTrace?.(id, verb.kind, span, describeTracePayload(payload), Date.now());
-      return verb;
+      verb = await handler(kernel, payload);
     } catch (error) {
-      this.#onTrace?.(id, 'fail', span, describeTracePayload(payload), Date.now());
-      throw error;
+      this.#notifyTrace(id, 'fail', span, payload);
+      throw error; // always the handler's own error — never a sink's throw
+    }
+    // Only `abort`/`fail` ever carry a `desc` (see `verb.ts`) — `next`/`divert`
+    // have no such member, so the extraction is a narrow, not a cast of convenience.
+    const desc = verb.kind === 'abort' || verb.kind === 'fail' ? verb.desc : undefined;
+    this.#notifyTrace(id, verb.kind, span, payload, desc); // outside the try — cannot turn this resolve into a reject
+    return verb;
+  }
+
+  /**
+   * The single containment point for `onTrace` notification, factored out of
+   * `invoke` so a throwing sink can never influence a `call`/`dispatch`
+   * outcome (see `invoke`'s doc comment). Establishes the kernel-wide
+   * invariant that **observation never changes program behavior**: a trace
+   * sink is a passive observer, not a participant in the flow it's watching.
+   *
+   * Rendering and sink dispatch are guarded *separately*, because they fail
+   * for different reasons and warrant different responses:
+   *
+   * - `describeTracePayload` throwing means the *payload* is unrenderable
+   *   (both its `JSON.stringify` and `String()` fallback tiers threw — an
+   *   extreme, pathological payload). That's a property of the traced data,
+   *   not of the sink, so the entry is kept and its `payload` degrades to
+   *   the fixed string `'<unrenderable>'` — silently dropping a `'fail'`
+   *   entry here would be exactly the invisibility docs/tracing.md's
+   *   "failing handlers are still recorded" contract exists to prevent.
+   * - The sink itself throwing means the sink is broken (a wiring bug, akin
+   *   to a `Buffer.mutate` listener throwing). That's reported via
+   *   `console.error` — the same non-throwing backstop `Buffer.mutate` uses
+   *   for its listeners — and *this* entry is dropped, since there is no
+   *   safe rendering to fall back to once the sink itself has failed.
+   */
+  #notifyTrace(id: string, kind: TraceVerbKind, span: Span, payload: unknown, desc?: string): void {
+    const sink = this.#onTrace;
+    if (sink === undefined) return; // tracing off: skip rendering and the sink call entirely
+    let rendered: string | undefined;
+    try {
+      rendered = describeTracePayload(payload);
+    } catch {
+      rendered = '<unrenderable>';
+    }
+    try {
+      sink(id, kind, span, rendered, Date.now(), desc);
+    } catch (error) {
+      console.error(`[kernelee] onTrace sink threw while recording '${id}' — trace entry dropped, call outcome unaffected:`, error);
     }
   }
 

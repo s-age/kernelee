@@ -146,6 +146,31 @@ behavior seen from `call`/`dispatch` is unchanged). Without this, every
 failure from a `register`-bound handler would vanish from the trace,
 defeating the point of showing what failed.
 
+**Observation never changes program behavior.** `onTrace` is a passive
+observer, not a participant in the flow it's watching, and `invoke`
+guarantees that in both directions:
+
+- If the sink itself throws, `invoke` contains the error and reports it via
+  `console.error` — the same non-throwing backstop `Buffer.mutate` uses for
+  its listeners, and the same precedent as `reportDetached` and
+  `CommandBus`'s trailing `.catch`. That trace entry is dropped, but the
+  `call`/`dispatch` outcome (resolve, reject, or `verb.kind`) is never
+  affected by whether the sink succeeded — re-thrown errors are always the
+  handler's own.
+- A sink must be synchronous. Assigning an `async` function type-checks
+  (it's still assignable to `=> void`), but the `Promise` it returns is not
+  covered by the containment above — a rejection there becomes an unhandled
+  rejection, not a caught one. Sinks that do async work must catch their own
+  errors.
+- If a payload defeats both of `describeTracePayload`'s rendering tiers
+  (`JSON.stringify` and its `String(payload)` fallback both throw — an
+  extreme, pathological payload), the entry is **not** dropped: its
+  `payload` degrades to the fixed string `'<unrenderable>'` instead. Payload
+  rendering failure is a property of the payload, not of the sink, so it is
+  kept distinct from a broken sink — dropping the entry here would
+  reintroduce exactly the "failing handler invisible to the trace" problem
+  the previous paragraph exists to prevent.
+
 Forest reconstruction (Swift's `TraceState.forest`, for call-tree UI) is not
 part of the core, and neither is delivery (WebSocket etc.) — the core stops
 at writing into `kernel.buffer`.

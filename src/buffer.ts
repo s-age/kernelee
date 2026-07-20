@@ -84,10 +84,15 @@ export function defineState<S>(id: string, initial: S): StateKey<S> {
 // MARK: - Built-in state
 
 /**
- * The value shape of {@link KernelErrorState}: one optional message, written
- * as `"symbolId: message"`, cleared (set back to `null`) by whoever displays
- * it. Swift models the same thing as `message: String?`; TS spells the
- * "explicitly empty" case `null` so a plain object literal can express it.
+ * The value shape of {@link KernelErrorState}: one optional message. The
+ * default error sink writes it as `"symbolId: message"`; an app that injects
+ * its own `onError` at `build` may write here from that sink too (or ignore
+ * the cell entirely). Clearing is the app's job, through its normal write
+ * path: the displaying view dispatches an app-declared clear command, and
+ * the layer that holds the kernel `mutate`s the cell back to
+ * `{ message: null }` — a sink only ever writes here, it never clears. Swift
+ * models the same thing as `message: String?`; TS spells the "explicitly
+ * empty" case `null` so a plain object literal can express it.
  */
 export interface KernelErrorValue {
   readonly message: string | null;
@@ -127,8 +132,17 @@ interface Cell {
 /**
  * Collects the buffer's named containers during app wiring — the state-side
  * counterpart of `KernelBuilder`. The composition root `allocate`s a
- * container per state key; once wiring is done, `build()` freezes them into
- * a `Buffer`.
+ * container per state key; once wiring is done, `build()` freezes the set of
+ * containers into a `Buffer`.
+ *
+ * The freeze is of the cell *set*, not the cells: `build()` snapshots which
+ * keys exist, but the `Cell` containers themselves stay shared — between the
+ * builder and every `Buffer` it builds, and therefore between two `Buffer`s
+ * built from the same builder (values *and* listeners; a `mutate` through one
+ * is observed through the other). This sharing is what lets a caller's
+ * explicit pre-build `allocate` stay authoritative and live. One builder is
+ * meant to build one kernel's buffer — it is not a state-sharing mechanism
+ * between kernels.
  */
 export class BufferBuilder {
   readonly #cells = new Map<string, Cell>();
@@ -165,12 +179,16 @@ export class BufferBuilder {
   }
 
   /**
-   * Freeze the containers into a `Buffer`, after seeding the framework-owned
-   * default: `KernelErrorState`, the target of the default error sink — a
-   * release feature, so unconditional. Callers allocate only their own app
-   * states. (Swift's `build()` also seeds the DEBUG monitor states; the TS
-   * counterpart, `TraceState`, is allocated by `KernelBuilder.build`, and
-   * only when tracing is on.)
+   * Freeze the container *set* into a `Buffer`, after seeding the
+   * framework-owned default: `KernelErrorState`, the target of the default
+   * error sink — a release feature, so unconditional. Callers allocate only
+   * their own app states. (Swift's `build()` also seeds the DEBUG monitor
+   * states; the TS counterpart, `TraceState`, is allocated by
+   * `KernelBuilder.build`, and only when tracing is on.)
+   *
+   * A later `allocate` on the builder is invisible to an already-built
+   * `Buffer`, but the shared cells mean value/listener traffic crosses freely
+   * between builds.
    */
   build(): Buffer {
     this.allocateIfAbsent(KernelErrorState);

@@ -1,40 +1,7 @@
-import type { Kernel } from './kernel.js';
+import { KernelError, type Kernel } from './kernel.js';
 import type { KernelSymbol } from './symbol.js';
 import type { DispatchKey } from './dispatch-key.js';
 import { divert, next, type ErasedStage, type Verb } from './verb.js';
-
-// MARK: - Branch arity (fork's static fan-out declaration)
-
-/**
- * How many branches a `fork` stage fans out to — as *declared*, not merely as
- * built. The distinction matters to introspection consumers: a pipe value can
- * be constructed purely for cataloguing, and then its `branches` array holds
- * however many branches that one construction happened to build — which says
- * nothing about production. `fixed` promises the arity is structural (every
- * construction builds exactly `count`); `runtime` says the branch array is
- * sized per invocation and the built count is incidental.
- *
- * Swift's `BranchArity` enum (`.fixed(Int)` / `.runtime`), as a discriminated
- * union with the {@link fixedArity} / {@link runtimeArity} constructors.
- */
-export type BranchArity =
-  /** Structurally fixed fan-out — every construction builds exactly `count`
-   * branches (the tuple `fork` overloads, or an array `fork` whose input is
-   * constant). */
-  | { readonly kind: 'fixed'; readonly count: number }
-  /** The branch array is sized per invocation (a fan-out over a runtime
-   * list); the descriptor's `branches` show one construction, not the
-   * production arity. Declared at the definition site via the array `fork`'s
-   * optional `arity` argument. */
-  | { readonly kind: 'runtime' };
-
-/** Declare a structurally fixed fan-out of `count` branches — Swift `.fixed(count)`. */
-export function fixedArity(count: number): BranchArity {
-  return { kind: 'fixed', count };
-}
-
-/** Declare a per-invocation branch count — Swift `.runtime`. */
-export const runtimeArity: BranchArity = { kind: 'runtime' };
 
 // MARK: - Stage descriptor (static shape, for introspection)
 
@@ -56,7 +23,17 @@ export const runtimeArity: BranchArity = { kind: 'runtime' };
  *   inline anonymous arrow (or unnamed function expression) — there is no
  *   `fn.name` to capture. Identity is **absent**; only the author's `note`
  *   (prose) stands in for it.
- * - `branches` — fans out to sub-`Pipe`s.
+ * - `branches` — fans out to sub-`Pipe`s, fixed at construction (the tuple
+ *   overloads, or an array `fork` whose branch list was already built).
+ *   Identity lives one level down, in each branch's own descriptors.
+ *
+ * `fork` is the one method with *two* operands, `branches` and `symbol` —
+ * `fork(symbol)` fans a **runtime-sized** payload list out to the *same*
+ * symbol, once per element, instead of to N distinct sub-`Pipe`s built ahead
+ * of time. Its identity channel is the ordinary `symbol` one (`symbolId`,
+ * same as `pipe(symbol)`/`tap(symbol)`) — "how many times" is exactly what
+ * `kind` itself declares (no branch array to size), which is why this is a
+ * distinct `StageKind` literal rather than a third field on `fork(branches)`.
  *
  * `function` vs `closure` is not a style choice recorded after the fact — it
  * is the *same* `fn.name` check that also fills {@link StageDescriptor.handlerName},
@@ -72,7 +49,10 @@ export const runtimeArity: BranchArity = { kind: 'runtime' };
  * vocabulary superseded.
  *
  * Swift's `StageDescriptor.Kind`, adapted vocabulary (TS split the method
- * from the operand where Swift's `verb` stayed a single flat case).
+ * from the operand where Swift's `verb` stayed a single flat case). Ten
+ * literals, not Swift's flat `verb` case — `fork(symbol)` has no Swift
+ * counterpart yet (see {@link PipeBuilder.fork}'s doc comment on the
+ * `.fork(sym)` overload).
  */
 export type StageKind =
   | 'pipe(symbol)'
@@ -83,7 +63,8 @@ export type StageKind =
   | 'map(closure)'
   | 'effect(function)'
   | 'effect(closure)'
-  | 'fork(branches)';
+  | 'fork(branches)'
+  | 'fork(symbol)';
 
 /**
  * The static shape of one pipe stage — the part that depends neither on the
@@ -110,22 +91,25 @@ export interface StageDescriptor {
    * The dotted symbol id this stage invokes (`Layer.Device.method`), or
    * `undefined` for a stage whose kind isn't a `symbol` operand
    * (`pipe(function)`/`pipe(closure)`/`map(function)`/`map(closure)`/
-   * `effect(function)`/`effect(closure)`).
+   * `effect(function)`/`effect(closure)`/`fork(branches)`). Present for
+   * `fork(symbol)` exactly like `pipe(symbol)`/`tap(symbol)` — it is the same
+   * identity channel, just fanned out N times at runtime instead of run once.
    */
   readonly symbolId?: string;
   /**
-   * "What this part does": for a symbol stage, the symbol's `description`
-   * (which a symbol generator can fill from the port method's doc comment);
-   * for an anonymous `pipe(function)`/`pipe(closure)` stage, the author's
+   * "What this part does": for a symbol stage (including `fork(symbol)`, the
+   * fanned-out symbol's own `description`), the symbol's `description` (which
+   * a symbol generator can fill from the port method's doc comment); for an
+   * anonymous `pipe(function)`/`pipe(closure)` stage, the author's
    * `note` ({@link VerbStageMeta.note}, required — a dispatch point earns a
    * forced channel); for `map(function)`/`map(closure)`/`effect(function)`/
    * `effect(closure)`/`fork(branches)`, the author's optional
    * {@link StageMeta.note} (a relief valve, not a requirement — those kinds
    * are already legible as a bare `kind` with no note at all — and, for the
    * `(function)` variants, a `handlerName` besides). `undefined` for an
-   * undocumented symbol, or a `map`/`effect`/`fork` stage whose author
-   * declined the optional note (a `pipe` stage's `note` is required, so that
-   * case never arises there). (Swift folds both into
+   * undocumented symbol, or a `map`/`effect`/`fork(branches)` stage whose
+   * author declined the optional note (a `pipe` stage's `note` is required,
+   * so that case never arises there). (Swift folds both into
    * `StageDescriptor.description`; the TS field is named after the
    * anonymous-stage `note` that most often fills it.)
    */
@@ -153,9 +137,12 @@ export interface StageDescriptor {
   readonly divertsTo: readonly string[];
   /**
    * `fork(branches)` only: each branch's own `descriptors` (it is a sub
-   * `Pipe`), in the order they were forked. `undefined` for every other kind.
-   * (Swift defaults this to `[]` on non-fork stages; the TS port spells "not
-   * a fork" as absence, matching `branchArity`.)
+   * `Pipe`), in the order they were forked. `undefined` for every other kind
+   * — including `fork(symbol)`, whose fan-out is a runtime-sized list of
+   * payloads to the *same* symbol, not a construction-time list of distinct
+   * sub-`Pipe`s, so there is no `branches` tree to nest. (Swift defaults this
+   * to `[]` on non-fork stages; the TS port spells "not a fork(branches)
+   * stage" as absence.)
    */
   readonly branches?: readonly (readonly StageDescriptor[])[];
   /**
@@ -183,14 +170,6 @@ export interface StageDescriptor {
    * (`untrackedBranches: [[StageDescriptor]]`, default `[]`).
    */
   readonly untrackedBranches?: readonly (readonly StageDescriptor[])[];
-  /**
-   * `fork(branches)` only: the declared fan-out arity — `fixedArity(n)` (the
-   * default: the branch count at construction) or `runtimeArity` when the
-   * definition site declares the branch array is sized per invocation,
-   * making the built `branches` a sample rather than the structure.
-   * `undefined` for every other kind.
-   */
-  readonly branchArity?: BranchArity;
   /**
    * The `.name` of the *function* that drives an anonymous `pipe`/`map`/
    * `effect` stage — the identifier at its definition site, e.g.
@@ -405,6 +384,11 @@ function buildDivertChannel<T extends DivertTargets>(targets: T): DivertChannel<
  * parameter there, and Swift's `note:` still rides along with its
  * `#filePath`/`#line` capture, which this port already declined to fake —
  * see {@link StageDescriptor}'s "no `wireSite`" note above).
+ *
+ * Being a plain data object (prototype chain bottoms out at `Object.prototype`
+ * or `null` immediately) is itself part of the discrimination contract — see
+ * `isStageMeta` in pipe.ts. Do not construct a `meta` value from a class
+ * instance; it will not be recognized as meta.
  */
 export interface StageMeta {
   readonly note?: string;
@@ -417,7 +401,10 @@ export interface StageMeta {
  * unsealed `PipeBuilder` (fork seals it on the spot — same convenience as
  * `kernel.compose(builder, …)`; Swift's `fork` takes sealed `Pipe`s only).
  * `Cursor` is the forking pipe's current value — every branch receives it —
- * and `R` is that branch's own result.
+ * and `R` is that branch's own result. Strictly: only a `Pipe`/`PipeBuilder`
+ * constructed by *this* kernelee module instance qualifies — a cross-copy
+ * value (e.g. from a duplicated kernelee install) is rejected by `sealBranch`
+ * with a diagnostic `TypeError` rather than accepted by duck typing.
  */
 export type ForkBranch<Cursor, R> = Pipe<Cursor, R> | PipeBuilder<Cursor, R>;
 
@@ -732,21 +719,35 @@ export class PipeBuilder<in Input, out Cursor> {
    * complete uselessly. AbortSignal plumbing is deliberately out of scope
    * (future work).
    *
-   * The array overload's `arity` is the definition site's declaration of what
-   * the branch count *means* (see {@link BranchArity}): omitted, the
-   * descriptor records `fixedArity(branches.length)`; pass {@link runtimeArity}
-   * when the array is sized per invocation, so introspection consumers don't
-   * mistake one construction's count for structure. (Tuple overloads always
-   * stamp their structural arity.)
-   *
-   * Every shape also has an optional-leading-`meta` twin ({@link StageMeta}):
+   * Every shape above also has an optional-leading-`meta` twin ({@link StageMeta}):
    * `fork` is the stage that needs the note relief valve least (its
    * `branches` are self-describing sub-`Pipe`s), but the one thing they never
    * carry — *why fan out here at all* — still deserves a channel. Non-
-   * breaking: the runtime tells the two families apart by *shape*, not by an
-   * extra flag — `meta` is a plain `{ note?: string }` object, never a `Pipe`/
-   * `PipeBuilder` instance nor an array, so it can never be mistaken for a
-   * branch or a branch list.
+   * breaking: the runtime tells the two families apart by *positively
+   * validating* the `meta` shape — `meta` must itself be a plain
+   * `{ note?: string }` object (no extra flag needed) — rather than assuming
+   * "not a branch shape ⇒ meta". Branches accepted here are strict, too: only
+   * a `Pipe`/`PipeBuilder` constructed by this kernelee instance is a branch;
+   * any other value (including a cross-copy `Pipe`/`PipeBuilder` from a
+   * duplicated kernelee install) is rejected with a diagnostic `TypeError` by
+   * `sealBranch`, never silently absorbed as meta nor silently duck-typed
+   * through.
+   *
+   * **`fork(symbol)` is a second, unrelated vocabulary** (see the dedicated
+   * overload below): every shape above is *static* fan-out — the branch
+   * count and each branch's own shape are fixed the moment this builder
+   * method runs, at pipe-construction time. `fork(symbol)` is *dynamic*
+   * fan-out — the branch count is a runtime fact (the length of whatever
+   * list is flowing through when the pipe actually runs), and there is only
+   * ever one "branch shape": the same symbol, invoked once per element.
+   * Nothing here (`branches`, `untrackedBranches`) applies to it — see
+   * `StageKind`'s own doc comment on why "N is runtime" is `kind`'s own
+   * declaration for that overload. `BranchArity`/`fixedArity`/`runtimeArity`
+   * (removed — no longer exported) existed only to flag a `fork(branches)`
+   * array as "sized per invocation" for what was, until now, a workaround:
+   * several hand-built sub-`Pipe` variants constructed ahead of time to
+   * approximate a runtime-sized fan-out. `fork(symbol)` replaces that
+   * workaround directly, so the vocabulary it needed no longer has a use.
    */
   fork<R1, R2>(
     b1: ForkBranch<Cursor, R1>,
@@ -783,12 +784,10 @@ export class PipeBuilder<in Input, out Cursor> {
   ): PipeBuilder<Input, [R1, R2, R3, R4]>;
   fork<R>(
     branches: ReadonlyArray<ForkBranch<Cursor, R>>,
-    arity?: BranchArity,
   ): PipeBuilder<Input, R[]>;
   fork<R>(
     meta: StageMeta,
     branches: ReadonlyArray<ForkBranch<Cursor, R>>,
-    arity?: BranchArity,
   ): PipeBuilder<Input, R[]>;
   /**
    * Tracked + **untracked** (detached) form: the first array joins exactly
@@ -811,11 +810,11 @@ export class PipeBuilder<in Input, out Cursor> {
    *   detached branch's failure has a first-class home instead of a hand-rolled
    *   `.catch`.
    *
-   * Runtime discrimination is the same "shape gap" the leading-`meta` twin
-   * uses: after the meta strip, `Array.isArray(args[1])` tells the tracked +
-   * untracked form (`fork([a,b], [c])`) apart from the array + arity form
-   * (`fork([a,b], runtimeArity)`) — a {@link BranchArity} is an object, never
-   * an array. `arity` (for the *tracked* set) is then `args[2]`.
+   * Runtime discrimination is a shape check like the leading-`meta` twin's
+   * (positive there, structural here): after the meta strip,
+   * `Array.isArray(args[1])` tells the tracked + untracked form
+   * (`fork([a,b], [c])`) apart from the plain array form (`fork([a,b])`,
+   * `args[1]` absent).
    *
    * `fork([], [x])` is the pure-launch degenerate case: no tracked branches,
    * so the cursor becomes `unknown[]` (`[]`), and `x` runs detached — see
@@ -824,48 +823,90 @@ export class PipeBuilder<in Input, out Cursor> {
   fork<R>(
     tracked: ReadonlyArray<ForkBranch<Cursor, R>>,
     untracked: ReadonlyArray<ForkBranch<Cursor, unknown>>,
-    arity?: BranchArity,
   ): PipeBuilder<Input, R[]>;
   fork<R>(
     meta: StageMeta,
     tracked: ReadonlyArray<ForkBranch<Cursor, R>>,
     untracked: ReadonlyArray<ForkBranch<Cursor, unknown>>,
-    arity?: BranchArity,
   ): PipeBuilder<Input, R[]>;
+  /**
+   * **Dynamic fan-out — `fork(symbol)`.** Unlike every shape above (a
+   * construction-time list of distinct sub-`Pipe`s), this fans a
+   * **runtime-sized** payload list — whatever `ReadonlyArray<P>` is flowing
+   * through as `Cursor` — out to the *same* symbol, once per element, via
+   * `kernel.invoke` (the identical chokepoint `.pipe(sym)` itself uses — see
+   * that method's own doc comment; gate application is therefore identical
+   * to an ordinary symbol stage, and the invoke count this produces is no
+   * different from N sequential `.pipe(sym)` stages, just concurrent).
+   * Order-preserving join, fail-fast — the same `Promise.all` join semantics
+   * as every other `fork` shape above (each element's `abort` fills that
+   * element's slot, a `divert` resolves to its target's own result, and any
+   * `fail` rejects the whole fork).
+   *
+   * `Cursor` must already be a `ReadonlyArray<P>` for some `P` — enforced via
+   * an explicit `this` parameter (not a class-level constraint on
+   * `PipeBuilder<Input, Cursor>` itself, which stays unconstrained so every
+   * other method keeps working for a non-array `Cursor`).
+   *
+   * **N ≥ 1 is a runtime contract, not merely a drawing convention.** An
+   * empty payload list throws `KernelError('emptyFanOut', sym.id, …)`
+   * (a wiring-defect-class failure, the same vocabulary
+   * `#resolveFlowKey`'s unbound-divert-key throw uses) rather than resolving
+   * to `[]`: this stage's `R[]` output can only be produced by *running the
+   * symbol* — the values are the contract's, not this stage's own to
+   * manufacture — so completing with `[]` on an empty input would silently
+   * fabricate "the symbol was fanned out over zero elements and produced
+   * zero results" without the symbol ever having run.
+   *
+   * **First (and, as of this writing, only) exception to "a fork-family
+   * method's operand is a `Pipe`/`PipeBuilder`, never anything else"** — see
+   * {@link spawn}'s own doc comment, which still holds to the pipe-only rule
+   * unchanged. Initial version: tracked only (no untracked/`.spawn` twin) —
+   * add one only once a real caller needs it.
+   */
+  fork<P, R>(this: PipeBuilder<Input, ReadonlyArray<P>>, symbol: KernelSymbol<P, R>): PipeBuilder<Input, R[]>;
   fork(
     first:
       | ForkBranch<never, unknown>
       | ReadonlyArray<ForkBranch<never, unknown>>
-      | StageMeta,
+      | StageMeta
+      | KernelSymbol<never, unknown>,
     ...rest: readonly (
       | ForkBranch<never, unknown>
       | ReadonlyArray<ForkBranch<never, unknown>>
-      | BranchArity
-      | undefined
     )[]
   ): PipeBuilder<Input, unknown> {
+    // Hazard: `isStageMeta` accepts ANY plain data object with no extra
+    // flag — and a `KernelSymbol` (`{ id, description? }`, see symbol.ts) IS
+    // one. Checked here, first, exactly like `pipe`/`pipeline` already do
+    // (`'id' in first`, pipe.ts's own `pipe`/`pipeline` implementations) —
+    // without this ordering a bare `.fork(sym)` call would be silently
+    // absorbed as an empty `meta` and fork zero branches instead of
+    // fanning out to the symbol.
+    if ('id' in first) {
+      return this.#forkSymbolStage(first as KernelSymbol<never, unknown>);
+    }
     // `meta` is never a `Pipe`/`PipeBuilder` (a branch) nor an array (a
     // branch list) — that shape gap is what lets the optional leading `meta`
-    // twin coexist with every existing call, no flag required.
-    const hasMeta = !Array.isArray(first) && !(first instanceof Pipe) && !(first instanceof PipeBuilder);
+    // twin coexist with every existing call, no flag required. `isStageMeta`
+    // validates the `{ note?: string }` contract positively instead of
+    // guessing "not a branch shape ⇒ meta".
+    const hasMeta = isStageMeta(first);
     const meta = hasMeta ? (first as StageMeta) : undefined;
     const args = hasMeta ? rest : [first, ...rest];
 
     if (Array.isArray(args[0])) {
       const tracked = (args[0] as ReadonlyArray<ForkBranch<never, unknown>>).map(sealBranch);
-      // A second array is the untracked (detached) branch list; a non-array
-      // (or absent) `args[1]` is the tracked set's `BranchArity`. `BranchArity`
-      // is an object and never an array, so the two forms never collide.
+      // A second array is the untracked (detached) branch list; absent
+      // means the plain array form.
       if (Array.isArray(args[1])) {
         const untracked = (args[1] as ReadonlyArray<ForkBranch<never, unknown>>).map(sealBranch);
-        const arity = args[2] as BranchArity | undefined;
-        return this.#forkStage(tracked, arity ?? fixedArity(tracked.length), meta, untracked);
+        return this.#forkStage(tracked, meta, untracked);
       }
-      const arity = args[1] as BranchArity | undefined;
-      return this.#forkStage(tracked, arity ?? fixedArity(tracked.length), meta);
+      return this.#forkStage(tracked, meta);
     }
     const pipes = (args as readonly ForkBranch<never, unknown>[]).map(sealBranch);
-    return this.#forkStage(pipes, fixedArity(pipes.length), meta);
+    return this.#forkStage(pipes, meta);
   }
 
   /**
@@ -904,7 +945,7 @@ export class PipeBuilder<in Input, out Cursor> {
     const meta = second === undefined ? undefined : (first as StageMeta);
     const branch = (second === undefined ? first : second) as ForkBranch<never, unknown>;
     // `fork([], [branch])` semantics, but forward the cursor unchanged.
-    return this.#forkStage([], fixedArity(0), meta, [sealBranch(branch)], true) as PipeBuilder<Input, Cursor>;
+    return this.#forkStage([], meta, [sealBranch(branch)], true) as PipeBuilder<Input, Cursor>;
   }
 
   /**
@@ -939,7 +980,6 @@ export class PipeBuilder<in Input, out Cursor> {
    */
   #forkStage(
     pipes: readonly Pipe<unknown, unknown>[],
-    branchArity: BranchArity,
     meta?: StageMeta,
     untracked: readonly Pipe<unknown, unknown>[] = [],
     forwardCursor = false,
@@ -967,7 +1007,6 @@ export class PipeBuilder<in Input, out Cursor> {
         note: meta?.note,
         divertsTo: [],
         branches: pipes.map((pipe) => pipe.descriptors),
-        branchArity,
         // Absent (not empty) when there are no untracked branches — matches
         // how `branches` is absent on a non-fork stage.
         ...(untrackedBranches.length > 0 ? { untrackedBranches } : {}),
@@ -1001,15 +1040,101 @@ export class PipeBuilder<in Input, out Cursor> {
     });
   }
 
+  /**
+   * The `fork(symbol)` stage — the dynamic-fan-out counterpart of
+   * {@link #forkStage}. One symbol, invoked once per element of whatever
+   * `ReadonlyArray` is flowing, concurrently; order-preserving, fail-fast —
+   * see the public `.fork(symbol)` overload's own doc comment for the full
+   * contract (gate parity with `.pipe(sym)`, the N ≥ 1 runtime contract).
+   *
+   * Each element is run through `kernel.runStages([invokeStage], item,
+   * parentSpan)` rather than a bare `kernel.invoke` — one-stage `runStages`
+   * reduces to exactly one `invoke` call (so the invoke count and the gate
+   * chokepoint are unchanged from an ordinary `.pipe(sym)` stage), but
+   * `runStages` also resolves the returned `Verb` the same way every other
+   * `fork` shape's branch join does (`next` → the value, `abort` → that
+   * element's own value, `divert` → the diverted pipe's own result, `fail` →
+   * a rejection) — the identical join semantics {@link #forkStage} gets from
+   * running each branch through `runStages` too, just with a one-stage
+   * "branch" built from the symbol instead of an author-built sub-`Pipe`.
+   */
+  #forkSymbolStage<P, R>(sym: KernelSymbol<P, R>): PipeBuilder<Input, R[]> {
+    const invokeStage: ErasedStage = (kernel, item, parentSpan) => kernel.invoke(sym.id, item, parentSpan);
+    return this.#appending({
+      descriptor: {
+        kind: 'fork(symbol)',
+        symbolId: sym.id,
+        note: sym.description,
+        divertsTo: [],
+      },
+      run: async (kernel, value, parentSpan) => {
+        const items = value as ReadonlyArray<unknown>;
+        if (items.length === 0) {
+          throw new KernelError(
+            'emptyFanOut',
+            sym.id,
+            `fork(${sym.id}): empty fan-out — a fork(symbol) stage's payload array must have at least one element`,
+          );
+        }
+        const results = await Promise.all(
+          items.map((item) => kernel.runStages([invokeStage], item, parentSpan)),
+        );
+        return next(results);
+      },
+    }) as PipeBuilder<Input, R[]>;
+  }
+
   /** Freeze the builder. `Output` is whatever is flowing now (`Cursor`). */
   seal(): Pipe<Input, Cursor> {
     return new Pipe<Input, Cursor>(this.#stages);
   }
 }
 
-/** Normalize a fork branch: a builder is sealed on the spot, a pipe passes through. */
+/**
+ * StageMeta is declared as a plain data object ({ note?: string }) — this
+ * validates that declaration positively, instead of guessing "not a branch
+ * shape ⇒ meta". A class instance from ANY module copy or realm (its
+ * prototype chain does not bottom out immediately) is never meta, so a
+ * duplicate-kernelee-copy PipeBuilder can no longer be silently swallowed
+ * as meta. Realm-safe: checks chain shape, not identity.
+ *
+ * Known residual gap (inherent to the overload shape): a *plain-object*
+ * branch-like value in the leading position (e.g. a deserialized
+ * descriptor bag) is structurally indistinguishable from an empty meta
+ * `{}` and is still accepted as meta. Branch validation happens one step
+ * later, in `sealBranch`.
+ */
+function isStageMeta(x: unknown): x is StageMeta {
+  if (typeof x !== 'object' || x === null) return false;
+  const proto = Object.getPrototypeOf(x);
+  return proto === null || Object.getPrototypeOf(proto) === null;
+}
+
+/**
+ * Normalize a fork branch: a builder is sealed on the spot, a pipe passes
+ * through. Strict by contract: only a Pipe/PipeBuilder constructed by THIS
+ * kernelee instance is a branch — cross-copy values are rejected loudly
+ * (builder and sealed Pipe alike, symmetrically) instead of half-working
+ * until a version skew detonates later.
+ */
 function sealBranch(branch: ForkBranch<never, unknown>): Pipe<unknown, unknown> {
-  return (branch instanceof Pipe ? branch : branch.seal()) as Pipe<unknown, unknown>;
+  if (branch instanceof Pipe) return branch as Pipe<unknown, unknown>;
+  if (branch instanceof PipeBuilder) return branch.seal() as Pipe<unknown, unknown>;
+  throw new TypeError(
+    `fork/spawn branch must be a Pipe or PipeBuilder created by this kernelee instance ` +
+      `(and a leading meta must be a plain { note?: string } object); received ${describeValue(branch)}. ` +
+      `If this value IS a kernelee Pipe/PipeBuilder, a likely cause is a duplicated kernelee copy in node_modules.`,
+  );
+}
+
+/** Human/LLM-readable description of a rejected value. Null-safe. */
+function describeValue(x: unknown): string {
+  if (x === null) return 'null';
+  if (x === undefined) return 'undefined';
+  if (typeof x === 'object' || typeof x === 'function') {
+    return `an instance of ${Object.getPrototypeOf(x)?.constructor?.name ?? '(null prototype)'}`;
+  }
+  return `a ${typeof x} (${String(x)})`;
 }
 
 /**

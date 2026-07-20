@@ -24,15 +24,29 @@ import type { DispatchKey } from './dispatch-key.js';
 export type Verb<F> =
   /** Continue: `F` becomes the next stage's payload. */
   | { readonly kind: 'next'; readonly value: F }
-  /** Normal early termination: stop here, this value is the pipe's result. */
-  | { readonly kind: 'abort'; readonly value: unknown }
+  /**
+   * Normal early termination: stop here, this value is the pipe's result.
+   *
+   * `desc`, when given, is a human-readable reason for this terminal
+   * transition — surfaced both in the static index (kernel-introspect's
+   * scanner recovers the string literal at the call site) and in the runtime
+   * trace (see `trace.ts`'s `TraceEntry.desc`).
+   */
+  | { readonly kind: 'abort'; readonly value: unknown; readonly desc?: string }
   /**
    * Drop the remaining stages and run another pipe instead; its result
    * becomes this pipe's result.
    */
   | { readonly kind: 'divert'; readonly diversion: Diversion }
-  /** Abnormal termination: throw out of the pipe / `call`. */
-  | { readonly kind: 'fail'; readonly error: unknown };
+  /**
+   * Abnormal termination: throw out of the pipe / `call`.
+   *
+   * `desc`, when given, is a human-readable reason for this terminal
+   * transition — surfaced both in the static index (kernel-introspect's
+   * scanner recovers the string literal at the call site) and in the runtime
+   * trace (see `trace.ts`'s `TraceEntry.desc`).
+   */
+  | { readonly kind: 'fail'; readonly error: unknown; readonly desc?: string };
 
 /**
  * Continue with `value` as the next stage's payload.
@@ -58,9 +72,14 @@ export function next(value?: unknown): Verb<unknown> {
  * Terminate normally with `value` as the pipe's result. Returns `Verb<never>`
  * so it is assignable to any `Verb<F>` — a terminator feeds no downstream
  * stage, so it carries no forward type.
+ *
+ * `desc` is an optional human-readable reason for this abort — a static
+ * index (kernel-introspect's scanner recovers a string-literal argument at
+ * the call site) and a runtime trace entry (`TraceEntry.desc`) may both
+ * expose it. Omitted, no `desc` property is present on the returned `Verb`.
  */
-export function abort(value: unknown): Verb<never> {
-  return { kind: 'abort', value };
+export function abort(value: unknown, desc?: string): Verb<never> {
+  return desc === undefined ? { kind: 'abort', value } : { kind: 'abort', value, desc };
 }
 
 /** Drop the remaining stages and run `target` instead. */
@@ -68,9 +87,16 @@ export function divert(target: Diversion): Verb<never> {
   return { kind: 'divert', diversion: target };
 }
 
-/** Terminate abnormally: `error` is thrown out of the pipe / `call`. */
-export function fail(error: unknown): Verb<never> {
-  return { kind: 'fail', error };
+/**
+ * Terminate abnormally: `error` is thrown out of the pipe / `call`.
+ *
+ * `desc` is an optional human-readable reason for this failure — a static
+ * index (kernel-introspect's scanner recovers a string-literal argument at
+ * the call site) and a runtime trace entry (`TraceEntry.desc`) may both
+ * expose it. Omitted, no `desc` property is present on the returned `Verb`.
+ */
+export function fail(error: unknown, desc?: string): Verb<never> {
+  return desc === undefined ? { kind: 'fail', error } : { kind: 'fail', error, desc };
 }
 
 // MARK: - Diversion

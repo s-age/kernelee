@@ -1,12 +1,12 @@
 import { expect, test } from 'vitest';
 import {
+  declareGate,
   fail,
-  fixedArity,
   next,
   pipeline,
-  runtimeArity,
   symbol,
   KernelBuilder,
+  KernelError,
   type Kernel,
 } from '../src/index.js';
 
@@ -192,47 +192,6 @@ test('forkArrayFailFastSettlesOnFirstRejection', async () => {
   expect(hits).toEqual(['slow:completed']);
 });
 
-// MARK: - Branch arity (static descriptor)
-
-test('arrayForkStampsFixedArityFromTheBuiltBranchCountByDefault', () => {
-  const branches = [0, 1, 2].map(() => pipeline(double).seal());
-  const pipe = pipeline(identity).fork(branches).seal();
-  const fork = pipe.descriptors.at(-1)!;
-  expect(fork.kind).toBe('fork(branches)');
-  expect(fork.branchArity).toEqual(fixedArity(3));
-});
-
-test('arrayForkRecordsRuntimeArityWhenTheDefinitionSiteDeclaresIt', () => {
-  // A probe construction (1 branch) whose definition site knows the array is
-  // sized per invocation: the descriptor must say runtime, not fixed(1).
-  const pipe = pipeline(identity)
-    .fork([pipeline(double).seal()], runtimeArity)
-    .seal();
-  expect(pipe.descriptors.at(-1)!.branchArity).toEqual(runtimeArity);
-});
-
-test('tupleForksStampTheirStructuralArity', () => {
-  const two = pipeline(identity).fork(pipeline(double).seal(), pipeline(stringify).seal()).seal();
-  expect(two.descriptors.at(-1)!.branchArity).toEqual(fixedArity(2));
-  const three = pipeline(identity)
-    .fork(pipeline(double).seal(), pipeline(square).seal(), pipeline(stringify).seal())
-    .seal();
-  expect(three.descriptors.at(-1)!.branchArity).toEqual(fixedArity(3));
-  const four = pipeline(identity)
-    .fork(pipeline(double).seal(), pipeline(square).seal(), pipeline(stringify).seal(), pipeline(identity).seal())
-    .seal();
-  expect(four.descriptors.at(-1)!.branchArity).toEqual(fixedArity(4));
-});
-
-test('nonForkStagesCarryNoBranchArity', () => {
-  const sink = symbol<number, void>('fork.sink');
-  const pipe = pipeline(identity)
-    .map((n) => n)
-    .tap(sink)
-    .seal();
-  expect(pipe.descriptors.every((d) => d.branchArity === undefined)).toBe(true);
-});
-
 // MARK: - Optional meta note (the relief valve — Swift `fork(note:)`)
 
 test('forkLiftsAnOptionalMetaNoteIntoTheDescriptorAcrossEveryShape', () => {
@@ -256,58 +215,40 @@ test('forkLiftsAnOptionalMetaNoteIntoTheDescriptorAcrossEveryShape', () => {
   const array = pipeline(identity)
     .fork({ note: 'why array' }, [pipeline(double).seal(), pipeline(square).seal()])
     .seal();
-  const arrayArity = pipeline(identity)
-    .fork({ note: 'why runtime array' }, [pipeline(double).seal()], runtimeArity)
-    .seal();
 
   expect(two.descriptors.at(-1)!.note).toBe('why two');
   expect(three.descriptors.at(-1)!.note).toBe('why three');
   expect(four.descriptors.at(-1)!.note).toBe('why four');
   expect(array.descriptors.at(-1)!.note).toBe('why array');
-  expect(arrayArity.descriptors.at(-1)!.note).toBe('why runtime array');
 });
 
 test('forkLeavesNoteUndefinedWhenMetaOmittedAcrossEveryShape', () => {
   // Regression guard for the `hasMeta` runtime discrimination: the pre-
   // existing shapes (no leading meta) must still stamp `note: undefined`.
   const two = pipeline(identity).fork(pipeline(double).seal(), pipeline(square).seal()).seal();
-  const array = pipeline(identity).fork([pipeline(double).seal()], runtimeArity).seal();
+  const array = pipeline(identity).fork([pipeline(double).seal()]).seal();
 
   expect(two.descriptors.at(-1)!.note).toBeUndefined();
   expect(array.descriptors.at(-1)!.note).toBeUndefined();
 });
 
-test('forkMetaOverloadReadsArityFromTheRightSlotAndPreservesBranchStructure', () => {
-  // The off-by-one hotspot: with a leading meta, `arity` becomes args[1], not
-  // args[0]. The meta and non-meta array+arity calls must agree on both
-  // `branchArity` and `branches` — the note must not shift or corrupt the
-  // branch structure it rides alongside.
+test('forkMetaArrayPreservesBranchStructureUnderTheLeadingNote', () => {
+  // The off-by-one hotspot the leading-meta twin must avoid: with a leading
+  // meta, the branches array becomes args[1], not args[0] — the note must
+  // not shift or corrupt the branch structure it rides alongside.
   const branches = () => [pipeline(double).seal(), pipeline(square).seal(), pipeline(identity).seal()];
-  const withMeta = pipeline(identity).fork({ note: 'runtime fan-out' }, branches(), runtimeArity).seal();
-  const withoutMeta = pipeline(identity).fork(branches(), runtimeArity).seal();
+  const withMeta = pipeline(identity).fork({ note: 'fan-out' }, branches()).seal();
+  const withoutMeta = pipeline(identity).fork(branches()).seal();
 
   const metaFork = withMeta.descriptors.at(-1)!;
   const plainFork = withoutMeta.descriptors.at(-1)!;
 
-  // arity read from args[1] under meta, args[1] (…of the shifted slice) without.
-  expect(metaFork.branchArity).toEqual(runtimeArity);
-  expect(metaFork.branchArity).toEqual(plainFork.branchArity);
-  // Branch structure is identical — meta injection left it untouched.
   expect(metaFork.branches!.map((b) => b.map((d) => d.kind))).toEqual(
     plainFork.branches!.map((b) => b.map((d) => d.kind)),
   );
   expect(metaFork.branches!.map((b) => b.map((d) => d.symbolId))).toEqual(
     plainFork.branches!.map((b) => b.map((d) => d.symbolId)),
   );
-});
-
-test('forkMetaArrayDefaultsToFixedArityFromTheBuiltCountJustLikeTheNonMetaShape', () => {
-  // Meta present, arity omitted: the descriptor must still record
-  // fixedArity(branches.length) — args[1] is undefined, not misread as arity.
-  const withMeta = pipeline(identity)
-    .fork({ note: 'fixed fan-out' }, [pipeline(double).seal(), pipeline(square).seal()])
-    .seal();
-  expect(withMeta.descriptors.at(-1)!.branchArity).toEqual(fixedArity(2));
 });
 
 test('forkMetaTupleAndArrayStillRunAndPreserveOrder', async () => {
@@ -338,4 +279,205 @@ test('forkAcceptsUnsealedBuildersAsBranches', async () => {
   const [a, b] = await kernel.compose(pipe, 5);
   expect(a).toBe(10);
   expect(b).toBe('5');
+});
+
+// MARK: - branch/meta discrimination is a positive contract (plain-object
+// meta, this-instance branches)
+
+/** A class instance that quacks like a `PipeBuilder` (a stand-in for a duplicate-kernelee-copy builder). */
+class ForeignishBuilder {
+  seal() {
+    return pipeline(double).seal();
+  }
+}
+
+/** A class instance that quacks like a sealed `Pipe` (a stand-in for a duplicate-kernelee-copy Pipe). */
+class FakePipe {
+  stages: unknown[] = [];
+  erasedStages: unknown[] = [];
+}
+
+test('forkRejectsAForeignBuilderInLeadingPositionInsteadOfSwallowingItAsMeta', () => {
+  // Old behavior: a class instance that isn't THIS module's Pipe/PipeBuilder
+  // fell into the `meta` bucket unnoticed and the branch silently vanished.
+  // New behavior: `isStageMeta` rejects it as meta (it's a class instance,
+  // not a plain data object), so it falls through to `sealBranch`, which
+  // rejects it loudly.
+  expect(() => {
+    pipeline(identity).fork(new ForeignishBuilder() as never, pipeline(square).seal());
+  }).toThrow(/Pipe or PipeBuilder created by this kernelee instance/);
+});
+
+test('forkRejectsAForeignPipeInABranchPosition', () => {
+  expect(() => {
+    pipeline(identity).fork(pipeline(double).seal(), new FakePipe() as never);
+  }).toThrow(/an instance of FakePipe/);
+});
+
+test('forkAcceptsAPlainObjectAsLeadingMetaButRejectsTheSameShapeAsABranch', () => {
+  // Residual gap (documented, not a bug): a plain-object branch-like value in
+  // the LEADING position is indistinguishable from an empty `{}` meta and is
+  // still absorbed as meta.
+  const asMeta = pipeline(identity).fork({ stages: [] } as never, pipeline(double).seal(), pipeline(square).seal()).seal();
+  expect(asMeta.descriptors.at(-1)!.note).toBeUndefined();
+  expect(asMeta.descriptors.at(-1)!.branches).toHaveLength(2);
+
+  // The same shape in a non-leading (branch) position is not meta — it must
+  // be a real Pipe/PipeBuilder, so it is rejected loudly.
+  expect(() => {
+    pipeline(identity).fork(pipeline(double).seal(), { stages: [] } as never);
+  }).toThrow(/an instance of Object/);
+});
+
+test('forkRejectsNullAndUndefinedBranchesWithADiagnosticInsteadOfACrypticCrash', () => {
+  expect(() => {
+    pipeline(identity).fork(pipeline(double).seal(), null as never);
+  }).toThrow(/received null/);
+  expect(() => {
+    pipeline(identity).fork(pipeline(double).seal(), undefined as never);
+  }).toThrow(/received undefined/);
+});
+
+test('spawnEnforcesTheSameStrictBranchContract', () => {
+  expect(() => {
+    pipeline(identity).spawn({ note: 'x' }, new ForeignishBuilder() as never);
+  }).toThrow(/Pipe or PipeBuilder created by this kernelee instance/);
+});
+
+test('metaPositiveShapeRegressionGuardAcrossPlainObjectVariants', () => {
+  // Every one of these is a plain data object — none is a class instance —
+  // so each must still be recognized as `meta`, not misfiled as a branch.
+  const empty = pipeline(identity).fork({}, pipeline(double).seal(), pipeline(square).seal()).seal();
+  expect(empty.descriptors.at(-1)!.note).toBeUndefined();
+
+  const frozen = pipeline(identity)
+    .fork(Object.freeze({ note: 'frozen' }), pipeline(double).seal(), pipeline(square).seal())
+    .seal();
+  expect(frozen.descriptors.at(-1)!.note).toBe('frozen');
+
+  const nullProto = pipeline(identity)
+    .fork(Object.assign(Object.create(null), { note: 'null-proto' }), pipeline(double).seal(), pipeline(square).seal())
+    .seal();
+  expect(nullProto.descriptors.at(-1)!.note).toBe('null-proto');
+});
+
+// MARK: - fork(symbol) — dynamic fan-out (Symbol × N)
+
+test('forkSymbolFansOutConcurrentlyAndPreservesOrder', async () => {
+  const events: string[] = [];
+  const timedEcho = symbol<{ tag: string; ms: number }, string>('fork.symbol.timedEcho');
+  const builder = new KernelBuilder();
+  builder.register(timedEcho, async ({ tag, ms }) => {
+    events.push(`${tag}:start`);
+    await sleep(ms);
+    events.push(`${tag}:end`);
+    return tag;
+  });
+  const kernel = builder.build();
+
+  const pipe = pipeline({ note: 'entry' }, (_kernel: Kernel, _payload: void) =>
+    next([
+      { tag: 'a', ms: 20 },
+      { tag: 'b', ms: 20 },
+    ]),
+  )
+    .fork(timedEcho)
+    .seal();
+
+  const results = await kernel.compose(pipe);
+  expect(results).toEqual(['a', 'b']); // order preserved regardless of completion order
+  // Both elements started before either finished — genuine concurrency, not
+  // a sequential N-times invoke loop.
+  expect(events.slice(0, 2)).toEqual(['a:start', 'b:start']);
+});
+
+/**
+ * Same fail-fast / no-cancellation split as the existing `fork(branches)`
+ * tests (`forkFailFastSettlesOnFirstRejection` etc.) — `fork(symbol)` reuses
+ * the identical `Promise.all` join, just fanning one symbol over payload
+ * elements instead of N distinct branch pipes over the one shared cursor.
+ */
+test('forkSymbolFailFastSettlesOnFirstRejectionWhileSiblingCompletesInBackground', async () => {
+  const hits: string[] = [];
+  const flaky = symbol<{ tag: string }, string>('fork.symbol.flaky');
+  const builder = new KernelBuilder();
+  builder.registerVerb(flaky, async ({ tag }) => {
+    if (tag === 'boom') return fail(new Boom());
+    await sleep(30);
+    hits.push(`${tag}:completed`);
+    return next(tag);
+  });
+  const kernel = builder.build();
+
+  const pipe = pipeline({ note: 'entry' }, (_kernel: Kernel, _payload: void) =>
+    next([{ tag: 'boom' }, { tag: 'slow' }]),
+  )
+    .fork(flaky)
+    .seal();
+
+  await expect(kernel.compose(pipe)).rejects.toBeInstanceOf(Boom);
+  expect(hits).toEqual([]); // rejects before the sibling settles
+  await until(() => hits.includes('slow:completed'));
+  expect(hits).toEqual(['slow:completed']); // …but the sibling was not cancelled
+});
+
+test('forkSymbolRejectsAnEmptyPayloadArrayWithAKernelError', async () => {
+  const builder = new KernelBuilder();
+  builder.register(double, (n) => n * 2);
+  const kernel = builder.build();
+
+  const pipe = pipeline({ note: 'entry' }, (_kernel: Kernel, _payload: void) => next([] as number[]))
+    .fork(double)
+    .seal();
+
+  const rejection = kernel.compose(pipe);
+  await expect(rejection).rejects.toBeInstanceOf(KernelError);
+  await expect(rejection).rejects.toThrow(/empty fan-out/);
+  await expect(rejection).rejects.toMatchObject({ code: 'emptyFanOut', symbolId: 'fork.double' });
+});
+
+/**
+ * `fork(symbol)` funnels each element through the identical `kernel.invoke`
+ * chokepoint a `.pipe(sym)` stage uses, so a guard on the fanned-out target
+ * applies once per element — not once for the whole fork.
+ */
+test('forkSymbolAppliesItsTargetsGatePerElementAtTheSameChokepointAsPipeSym', async () => {
+  const target = symbol<number, number>('fork.symbol.gated');
+  let gateRuns = 0;
+  const vetoNegative = declareGate<number>('guard:fork.symbol.gated', (_kernel: Kernel, n: number) => {
+    gateRuns += 1;
+    return n < 0 ? fail(new Boom()) : next();
+  });
+
+  const builder = new KernelBuilder();
+  builder.register(target, (n) => n * 2);
+  builder.guard(target, vetoNegative);
+  const kernel = builder.build();
+
+  const okPipe = pipeline({ note: 'entry' }, (_kernel: Kernel, _payload: void) => next([1, 2, 3]))
+    .fork(target)
+    .seal();
+  expect(await kernel.compose(okPipe)).toEqual([2, 4, 6]);
+  expect(gateRuns).toBe(3); // one gate evaluation per fanned-out element
+
+  gateRuns = 0;
+  const vetoPipe = pipeline({ note: 'entry' }, (_kernel: Kernel, _payload: void) => next([1, -1, 3]))
+    .fork(target)
+    .seal();
+  await expect(kernel.compose(vetoPipe)).rejects.toBeInstanceOf(Boom);
+});
+
+test('forkSymbolDescriptorCarriesOnlyKindSymbolIdNoBranchesNoUntrackedBranches', () => {
+  const pipe = pipeline(identity)
+    .map((n) => [n])
+    .fork(double)
+    .seal();
+  const forkDescriptor = pipe.descriptors.at(-1)!;
+
+  expect(forkDescriptor.kind).toBe('fork(symbol)');
+  expect(forkDescriptor.symbolId).toBe('fork.double');
+  expect(forkDescriptor.note).toBe(double.description); // `double` carries no description, so undefined
+  expect(forkDescriptor.divertsTo).toEqual([]);
+  expect(forkDescriptor.branches).toBeUndefined();
+  expect(forkDescriptor.untrackedBranches).toBeUndefined();
 });

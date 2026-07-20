@@ -1,8 +1,11 @@
 # Static wiring-graph snapshot
 
 `Pipe.descriptors` (`kind`/`symbolId`/`note`/`divertsTo`/`branches`/
-`branchArity`/`handlerName`) already carries a static topology readable
-without running anything. Swift's `WiringGraphView`
+`untrackedBranches`/`handlerName`) already carries a static topology readable
+without running anything — including `fork(symbol)`'s dynamic fan-out (a
+`kind: 'fork(symbol)'` stage carries only `symbolId`; there is no branch
+count to record ahead of time, since "how many" is a runtime fact — see
+`pipes-and-fork.md`'s "Dynamic: fork(symbol)" section). Swift's `WiringGraphView`
 (`Sources/KernelDebugUI/WiringGraph.swift`) likewise renders an injected
 static snapshot of `[PipeDescriptor]`, not runtime events. The TS port
 carries "1 Pipe → 1 catalog entry" and "catalog → JSON graph document" as
